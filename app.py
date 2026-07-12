@@ -91,6 +91,7 @@ PORTFOLIO_INPUT_KEY_MAP = {
     "portfolio_maintenance_allowance_pct": "portfolio_maintenance_allowance_pct_input",
     "portfolio_income_tax_rate": "portfolio_income_tax_rate_input",
 }
+PORTFOLIO_PM_USAGE_SETTING_KEY = "portfolio_property_manager_usage"
 
 DEFAULTS: Dict[str, Any] = {
     "listing_url": "",
@@ -227,6 +228,10 @@ def ensure_state() -> None:
     st.session_state.setdefault("_pending_active_page", None)
     st.session_state.setdefault("portfolio_settings_saved_notice", False)
     st.session_state.setdefault("portfolio_widget_nonce", 0)
+    st.session_state.setdefault("portfolio_property_manager_usage", {})
+    st.session_state.setdefault("portfolio_screener_row_keys", [])
+    st.session_state.setdefault("portfolio_screener_editor_applied_signature", "")
+    st.session_state.setdefault("_portfolio_pm_usage_loaded", False)
     for key, value in PORTFOLIO_DEFAULTS.items():
         st.session_state.setdefault(key, value)
     for key, input_key in PORTFOLIO_INPUT_KEY_MAP.items():
@@ -247,6 +252,16 @@ def ensure_state() -> None:
     else:
         ensure_portfolio_widget_state()
     st.session_state["_portfolio_settings_loaded"] = True
+    saved_portfolio_pm_usage = load_setting(PORTFOLIO_PM_USAGE_SETTING_KEY, {})
+    should_restore_portfolio_pm_usage = (
+        not st.session_state.get("_portfolio_pm_usage_loaded", False)
+        or not st.session_state.get("portfolio_property_manager_usage")
+    )
+    if should_restore_portfolio_pm_usage and isinstance(saved_portfolio_pm_usage, dict):
+        st.session_state["portfolio_property_manager_usage"] = {
+            str(name): as_bool(value, default=True) for name, value in saved_portfolio_pm_usage.items()
+        }
+    st.session_state["_portfolio_pm_usage_loaded"] = True
     if (
         not st.session_state.stamp_duty_auto_signature
         and st.session_state.stamp_duty_source_url
@@ -421,6 +436,57 @@ def sync_portfolio_widgets_to_inputs() -> None:
 def portfolio_input_value(key: str) -> Any:
     input_key = PORTFOLIO_INPUT_KEY_MAP[key]
     return st.session_state.get(input_key, st.session_state.get(key, PORTFOLIO_DEFAULTS[key]))
+
+
+def as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "y", "1", "on"}:
+            return True
+        if lowered in {"false", "no", "n", "0", "off"}:
+            return False
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def apply_portfolio_screener_manager_rate_edits() -> None:
+    editor_state = st.session_state.get("portfolio_screener_editor", {})
+    if not isinstance(editor_state, dict):
+        return
+
+    edited_rows = editor_state.get("edited_rows", {})
+    signature = repr(edited_rows)
+    if signature == str(st.session_state.get("portfolio_screener_editor_applied_signature", "")):
+        return
+
+    row_keys = st.session_state.get("portfolio_screener_row_keys", [])
+    if not isinstance(edited_rows, dict) or not isinstance(row_keys, list):
+        st.session_state["portfolio_screener_editor_applied_signature"] = signature
+        return
+
+    usage_map = dict(st.session_state.get("portfolio_property_manager_usage", {}))
+    has_changes = False
+    for row_index, changes in edited_rows.items():
+        if not isinstance(changes, dict) or "Use PM rate" not in changes:
+            continue
+        try:
+            row_position = int(row_index)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= row_position < len(row_keys):
+            usage_map[str(row_keys[row_position])] = as_bool(changes["Use PM rate"], default=True)
+            has_changes = True
+
+    st.session_state["portfolio_property_manager_usage"] = usage_map
+    st.session_state["portfolio_screener_editor_applied_signature"] = signature
+    if has_changes:
+        save_setting(PORTFOLIO_PM_USAGE_SETTING_KEY, usage_map)
 
 
 def current_payload() -> Dict[str, Any]:
@@ -910,9 +976,13 @@ def render_portfolio_screener_page(saved_properties: List[Dict[str, Any]]) -> No
         st.success("Portfolio screener inputs saved for next time.")
         st.session_state["portfolio_settings_saved_notice"] = False
 
+    apply_portfolio_screener_manager_rate_edits()
     shared = portfolio_shared_inputs()
-
-    screener = portfolio_screening_table(saved_properties, shared)
+    screener = portfolio_screening_table(
+        saved_properties,
+        shared,
+        st.session_state.get("portfolio_property_manager_usage", {}),
+    )
     if screener.empty:
         st.info("Saved properties need at least a price and weekly rent before they can be screened.")
         return
@@ -926,31 +996,41 @@ def render_portfolio_screener_page(saved_properties: List[Dict[str, Any]]) -> No
     metric_col_3.metric("WATCH", watch_count)
     metric_col_4.metric("AVOID", avoid_count)
 
-    st.dataframe(
-        screener.style.format(
-            {
-                "Price": currency,
-                "Rent / wk": currency,
-                "Council / yr": currency,
-                "Water / yr": currency,
-                "Strata / yr": currency,
-                "Stamp duty": currency,
-                "Deposit": currency,
-                "Cash upfront": currency,
-                "Loan needed": currency,
-                "Gross yield": "{:.2f}%",
-                "Net yield": "{:.2f}%",
-                "DSCR": "{:.2f}x",
-                "Break-even rent / wk": currency,
-                "Pre-tax CF / yr": currency,
-                "Post-tax CF / yr": currency,
-                "Overall / 10": "{:.1f}",
-            }
-        ).map(recommendation_cell_style, subset=["Recommendation"]),
-        use_container_width=True,
-        height=760,
+    st.session_state["portfolio_screener_row_keys"] = list(screener["Property"])
+    display_screener = screener.copy()
+    display_screener["Recommendation"] = display_screener["Recommendation"].map(recommendation_badge)
+    for column in [
+        "Price",
+        "Rent / wk",
+        "Council / yr",
+        "Water / yr",
+        "Strata / yr",
+        "Stamp duty",
+        "Deposit",
+        "Cash upfront",
+        "Loan needed",
+        "Break-even rent / wk",
+        "Pre-tax CF / yr",
+        "Post-tax CF / yr",
+    ]:
+        display_screener[column] = display_screener[column].map(currency)
+    display_screener["Gross yield"] = display_screener["Gross yield"].map(lambda value: f"{float(value):.2f}%")
+    display_screener["Net yield"] = display_screener["Net yield"].map(lambda value: f"{float(value):.2f}%")
+    display_screener["DSCR"] = display_screener["DSCR"].map(lambda value: f"{float(value):.2f}x")
+    display_screener["Overall / 10"] = display_screener["Overall / 10"].map(lambda value: f"{float(value):.1f}")
+
+    st.data_editor(
+        display_screener,
+        key="portfolio_screener_editor",
         hide_index=True,
+        use_container_width=True,
+        disabled=[column for column in display_screener.columns if column != "Use PM rate"],
+        column_config={
+            "Use PM rate": st.column_config.CheckboxColumn("Use PM rate"),
+        },
+        height=760,
     )
+    st.caption("Toggle `Use PM rate` per property to include or exclude the shared management fee from that row's screening calculations.")
 
 
 def suggested_loan_split(price: float, deposit_amount: float, buying_costs: float, deposit_source: str) -> Dict[str, float]:
@@ -1003,6 +1083,7 @@ def calculate_metrics(payload: Dict[str, Any]) -> Dict[str, Any]:
     landlord_insurance_annual = as_number(payload["landlord_insurance_annual"])
     annual_borrowing_costs = as_number(payload["annual_borrowing_costs"])
     property_manager_rate = as_number(payload["property_manager_rate"])
+    use_property_manager_rate = as_bool(payload.get("use_property_manager_rate"), default=True)
     depreciation_estimate = as_number(payload["depreciation_estimate"])
     income_tax_rate = as_number(payload["income_tax_rate"])
     deposit_source = str(payload["deposit_source"])
@@ -1043,7 +1124,8 @@ def calculate_metrics(payload: Dict[str, Any]) -> Dict[str, Any]:
     water_annual = water_quarterly * QUARTERS_PER_YEAR
     strata_annual = strata_quarterly * QUARTERS_PER_YEAR
     insurance_annual = building_insurance_annual + landlord_insurance_annual
-    property_manager_fee = effective_annual_rent * property_manager_rate / 100
+    applied_property_manager_rate = property_manager_rate if use_property_manager_rate else 0.0
+    property_manager_fee = effective_annual_rent * applied_property_manager_rate / 100
     fixed_holding_costs = council_annual + water_annual + strata_annual + insurance_annual
     operating_expenses = fixed_holding_costs + property_manager_fee + maintenance_allowance
     total_interest = sum(loan.annual_interest for loan in loans)
@@ -1155,6 +1237,8 @@ def calculate_metrics(payload: Dict[str, Any]) -> Dict[str, Any]:
         "water_annual": water_annual,
         "strata_annual": strata_annual,
         "insurance_annual": insurance_annual,
+        "use_property_manager_rate": use_property_manager_rate,
+        "applied_property_manager_rate": applied_property_manager_rate,
         "property_manager_fee": property_manager_fee,
         "fixed_holding_costs": fixed_holding_costs,
         "operating_expenses": operating_expenses,
@@ -1861,7 +1945,11 @@ def portfolio_shared_inputs() -> Dict[str, Any]:
     }
 
 
-def build_portfolio_screening_payload(saved: Dict[str, Any], shared: Dict[str, Any]) -> Dict[str, Any]:
+def build_portfolio_screening_payload(
+    saved: Dict[str, Any],
+    shared: Dict[str, Any],
+    use_property_manager_rate: bool = True,
+) -> Dict[str, Any]:
     payload = dict(DEFAULTS)
     payload.update(saved.get("payload", {}))
 
@@ -1896,6 +1984,7 @@ def build_portfolio_screening_payload(saved: Dict[str, Any], shared: Dict[str, A
             "building_insurance_annual": as_number(shared["building_insurance_annual"]),
             "landlord_insurance_annual": as_number(shared["landlord_insurance_annual"]),
             "property_manager_rate": as_number(shared["property_manager_rate"]),
+            "use_property_manager_rate": use_property_manager_rate,
             "vacancy_allowance_pct": as_number(shared["vacancy_allowance_pct"]),
             "maintenance_allowance_pct": as_number(shared["maintenance_allowance_pct"]),
             "income_tax_rate": as_number(shared["income_tax_rate"]),
@@ -1916,21 +2005,33 @@ def build_portfolio_screening_payload(saved: Dict[str, Any], shared: Dict[str, A
     return payload
 
 
-def portfolio_screening_table(saved_properties: List[Dict[str, Any]], shared: Dict[str, Any]) -> pd.DataFrame:
+def portfolio_screening_table(
+    saved_properties: List[Dict[str, Any]],
+    shared: Dict[str, Any],
+    property_manager_usage: Dict[str, Any] | None = None,
+) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
+    usage_map = property_manager_usage or {}
     for item in saved_properties:
         saved = load_property(str(item["name"]))
         if saved is None:
             continue
-        scenario_payload = build_portfolio_screening_payload(saved, shared)
+        property_name = str(item["name"])
+        use_property_manager_rate = as_bool(usage_map.get(property_name), default=True)
+        scenario_payload = build_portfolio_screening_payload(
+            saved,
+            shared,
+            use_property_manager_rate=use_property_manager_rate,
+        )
         if as_number(scenario_payload.get("price")) <= 0 or as_number(scenario_payload.get("weekly_rent")) <= 0:
             continue
         metrics = calculate_metrics(scenario_payload)
         rows.append(
             {
                 "Recommendation": str(metrics["recommendation"]),
+                "Use PM rate": use_property_manager_rate,
                 "Sold": "Yes" if bool(scenario_payload.get("is_sold")) else "No",
-                "Property": str(item["name"]),
+                "Property": property_name,
                 "State": str(item["state"]),
                 "Price": as_number(scenario_payload.get("price")),
                 "Rent / wk": as_number(scenario_payload.get("weekly_rent")),
@@ -1969,6 +2070,19 @@ def recommendation_cell_style(value: Any) -> str:
     if recommendation == "AVOID":
         return "background-color: #fee2e2; color: #991b1b; font-weight: 700;"
     return ""
+
+
+def recommendation_badge(value: Any) -> str:
+    recommendation = str(value).strip().upper()
+    if recommendation == "BUY":
+        return "🟢 BUY"
+    if recommendation == "WATCH":
+        return "🟡 WATCH"
+    if recommendation == "AVOID":
+        return "🔴 AVOID"
+    if recommendation == "INCOMPLETE":
+        return "⚪ INCOMPLETE"
+    return recommendation
 
 
 def save_portfolio_screener_inputs(shared: Dict[str, Any]) -> None:

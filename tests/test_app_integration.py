@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import app
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
@@ -76,8 +77,10 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
         self.assertEqual(len(app_test.exception), 0)
         self.assertEqual(len(app_test.dataframe), 1)
         screener = app_test.dataframe[0].value
+        self.assertIn("Use PM rate", screener.columns)
+        self.assertTrue(bool(screener.iloc[0]["Use PM rate"]))
         self.assertIn("DSCR", screener.columns)
-        self.assertGreater(float(screener.iloc[0]["DSCR"]), 0)
+        self.assertIn("x", str(screener.iloc[0]["DSCR"]))
 
     def test_loading_saved_property_from_sidebar_exits_portfolio_screener(self) -> None:
         saved_properties = [
@@ -334,6 +337,63 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             self.assertEqual(loaded_settings["portfolio_loan_rate"], 5.75)
             self.assertEqual(loaded_settings["portfolio_loan_years"], 26.0)
             self.assertEqual(loaded_settings["portfolio_repayment_type"], "I only")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_portfolio_screener_pm_toggle_round_trips_through_db(self) -> None:
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = Path(tmpdir) / "property_check.db"
+            saved_properties = [
+                {
+                    "name": "Saved One",
+                    "address": "1 Example Street, Melbourne VIC 3000",
+                    "state": "VIC",
+                    "is_favorite": 0,
+                    "updated_at": "2026-07-06 10:00:00",
+                }
+            ]
+            loaded_property = {
+                "name": "Saved One",
+                "address": "1 Example Street, Melbourne VIC 3000",
+                "payload": {
+                    "property_address": "1 Example Street, Melbourne VIC 3000",
+                    "price": 500_000.0,
+                    "property_value": 500_000.0,
+                    "weekly_rent": 620.0,
+                },
+            }
+            with (
+                patch.object(storage, "DB_PATH", db_path),
+                patch("statement_lookup.lookup_statement_of_information", return_value=SOI_FAILURE),
+                patch("storage.list_properties", return_value=saved_properties),
+                patch("storage.load_property", return_value=loaded_property),
+            ):
+                app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+                set_state_value(app_test, "active_page", "Portfolio screener")
+                app_test.run()
+                set_state_value(
+                    app_test,
+                    "portfolio_screener_editor",
+                    {"edited_rows": {"0": {"Use PM rate": False}}},
+                )
+                app_test.run()
+
+                loaded_usage = storage.load_setting(app.PORTFOLIO_PM_USAGE_SETTING_KEY, {})
+
+                reloaded_app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+                set_state_value(reloaded_app_test, "active_page", "Portfolio screener")
+                reloaded_app_test.run()
+
+            self.assertEqual(len(app_test.exception), 0)
+            self.assertEqual(loaded_usage, {"Saved One": False})
+            self.assertEqual(len(reloaded_app_test.exception), 0)
+            self.assertEqual(
+                reloaded_app_test.session_state["portfolio_property_manager_usage"],
+                {"Saved One": False},
+            )
+            reloaded_screener = reloaded_app_test.dataframe[0].value
+            self.assertFalse(bool(reloaded_screener.iloc[0]["Use PM rate"]))
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
