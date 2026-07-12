@@ -961,7 +961,7 @@ def current_payload():
 
 
 def main():
-    st.set_page_config(page_title="Property Check", page_icon="🏠", layout="wide")
+    st.set_page_config(page_title="Property Scout", page_icon="🏠", layout="wide")
     init_db()
     ensure_state()
 
@@ -995,7 +995,7 @@ def main():
             st.rerun()
 
     # Main Title
-    st.title("🏠 Property Check – Premium Investment Dashboard")
+    st.title("🏠 Property Scout – Premium Investment Dashboard")
 
     # Render UI Tabs
     payload = current_payload()

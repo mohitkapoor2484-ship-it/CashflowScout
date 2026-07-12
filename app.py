@@ -3889,7 +3889,7 @@ def render_tables(metrics: Dict[str, float | str | List[Loan]], payload: Dict[st
 
 
 def main() -> None:
-    st.set_page_config(page_title="Property Check", page_icon="🏠", layout="wide")
+    st.set_page_config(page_title="Property Scout", page_icon="🏠", layout="wide")
     init_db()
     ensure_state()
     consume_pending_payload_apply()
@@ -3902,7 +3902,7 @@ def main() -> None:
     st.markdown(
         """
         <div class="pc-shell">
-            <div class="pc-page-title">Property Check</div>
+            <div class="pc-page-title">Property Scout</div>
             <div class="pc-page-subtitle">
                 Compact analyst workspace for screening Australian residential deals.
                 Import the listing, verify the address and SOI, model the funding, then review the full feasibility pack.

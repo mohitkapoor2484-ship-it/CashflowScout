@@ -1,4 +1,4 @@
-# Property Check
+# Property Scout
 
 Streamlit tool for quickly screening an investment property purchase.
 

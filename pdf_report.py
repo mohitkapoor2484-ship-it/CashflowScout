@@ -586,7 +586,7 @@ def build_property_report(
         topMargin=10 * mm,
         bottomMargin=10 * mm,
         title="Property Feasibility Report",
-        author="Property Check",
+        author="Property Scout",
         subject="Residential property investment feasibility analysis",
     )
     styles = make_styles()
