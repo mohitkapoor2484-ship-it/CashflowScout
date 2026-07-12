@@ -1,0 +1,14 @@
+.pytest_cache/
+__pycache__/
+tmp/
+*.pyc
+
+property_check.db
+property_check.backup-*.db
+*.zip
+*.pdf
+
+.streamlit/secrets.toml
+.env
+.venv/
+venv/
