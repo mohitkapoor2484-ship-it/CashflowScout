@@ -18,9 +18,14 @@ import pdf_report
 from stamp_duty import calculate_stamp_duty
 from statement_lookup import extract_statement_pdf, lookup_statement_of_information
 from storage import (
+    DEFAULT_ADMIN_PASSWORD,
+    DEFAULT_ADMIN_USERNAME,
+    authenticate_user,
+    create_user,
     delete_property,
     init_db,
     list_properties,
+    list_users,
     load_property,
     load_setting,
     save_property,
@@ -232,6 +237,10 @@ def ensure_state() -> None:
     st.session_state.setdefault("portfolio_screener_row_keys", [])
     st.session_state.setdefault("portfolio_screener_editor_applied_signature", "")
     st.session_state.setdefault("_portfolio_pm_usage_loaded", False)
+    st.session_state.setdefault("is_authenticated", False)
+    st.session_state.setdefault("authenticated_username", "")
+    st.session_state.setdefault("authenticated_email", "")
+    st.session_state.setdefault("authenticated_is_admin", False)
     for key, value in PORTFOLIO_DEFAULTS.items():
         st.session_state.setdefault(key, value)
     for key, input_key in PORTFOLIO_INPUT_KEY_MAP.items():
@@ -366,6 +375,131 @@ def consume_pending_active_page() -> None:
     if pending_page:
         st.session_state["active_page"] = str(pending_page)
         st.session_state["_pending_active_page"] = None
+
+
+def set_authenticated_user(user: Dict[str, Any]) -> None:
+    st.session_state["is_authenticated"] = True
+    st.session_state["authenticated_username"] = str(user.get("username", ""))
+    st.session_state["authenticated_email"] = str(user.get("email", ""))
+    st.session_state["authenticated_is_admin"] = bool(user.get("is_admin"))
+
+
+def logout_user() -> None:
+    st.session_state["is_authenticated"] = False
+    st.session_state["authenticated_username"] = ""
+    st.session_state["authenticated_email"] = ""
+    st.session_state["authenticated_is_admin"] = False
+    st.session_state["active_page"] = "Property workspace"
+    reset_to_defaults()
+
+
+def render_admin_panel() -> None:
+    users = list_users()
+    st.markdown(
+        """
+        <div class="pc-card" style="margin-bottom:0.9rem;">
+            <div class="pc-card-title">Admin panel</div>
+            <div class="pc-meta">Review registered users and monitor who can access the workspace.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if (
+        str(st.session_state.get("authenticated_username", "")).lower() == DEFAULT_ADMIN_USERNAME.lower()
+        and st.session_state.get("authenticated_is_admin", False)
+    ):
+        st.warning(
+            f"The default admin account is active. Change the seeded password `{DEFAULT_ADMIN_PASSWORD}` in the database before sharing this app broadly."
+        )
+
+    metric_col_1, metric_col_2 = st.columns(2)
+    metric_col_1.metric("Total users", len(users))
+    metric_col_2.metric("Admins", sum(1 for user in users if bool(user.get("is_admin"))))
+    if not users:
+        st.info("No users registered yet.")
+        return
+
+    users_df = pd.DataFrame(
+        [
+            {
+                "Username": user["username"],
+                "Email": user["email"],
+                "Role": "Admin" if bool(user["is_admin"]) else "User",
+                "Created": user["created_at"],
+                "Updated": user["updated_at"],
+            }
+            for user in users
+        ]
+    )
+    st.dataframe(users_df, use_container_width=True, hide_index=True)
+
+
+def render_auth_page() -> None:
+    st.markdown(
+        """
+        <div class="pc-shell">
+            <div class="pc-page-title">Cashflow Scout</div>
+            <div class="pc-page-subtitle">
+                Sign in to access the property workspace, or create a user account for your team.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    login_tab, signup_tab, admin_tab = st.tabs(["Login", "Sign up", "Admin login"])
+
+    with login_tab:
+        with st.form("user_login_form"):
+            login_identifier = st.text_input("Username or email")
+            login_password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login", use_container_width=True)
+        if submitted:
+            user = authenticate_user(login_identifier, login_password)
+            if user is None:
+                st.error("Login failed. Check your username/email and password.")
+            else:
+                set_authenticated_user(user)
+                st.rerun()
+
+    with signup_tab:
+        with st.form("user_signup_form"):
+            signup_username = st.text_input("Username")
+            signup_email = st.text_input("Email")
+            signup_password = st.text_input("Password", type="password")
+            signup_confirm = st.text_input("Confirm password", type="password")
+            submitted = st.form_submit_button("Create account", use_container_width=True)
+        if submitted:
+            if signup_password != signup_confirm:
+                st.error("Passwords do not match.")
+            else:
+                created, message = create_user(signup_username, signup_email, signup_password)
+                if not created:
+                    st.error(message)
+                else:
+                    user = authenticate_user(signup_username, signup_password)
+                    if user is not None:
+                        set_authenticated_user(user)
+                        st.success("Account created and signed in.")
+                        st.rerun()
+                    else:
+                        st.success(message)
+
+    with admin_tab:
+        st.caption(
+            f"Default seeded admin login: username `{DEFAULT_ADMIN_USERNAME}` with password `{DEFAULT_ADMIN_PASSWORD}`. Change it after first access."
+        )
+        with st.form("admin_login_form"):
+            admin_identifier = st.text_input("Admin username or email")
+            admin_password = st.text_input("Admin password", type="password")
+            submitted = st.form_submit_button("Login as admin", use_container_width=True)
+        if submitted:
+            user = authenticate_user(admin_identifier, admin_password, require_admin=True)
+            if user is None:
+                st.error("Admin login failed.")
+            else:
+                set_authenticated_user(user)
+                st.session_state["active_page"] = "Admin panel"
+                st.rerun()
 
 
 def delete_loaded_property_and_reset() -> None:
@@ -3365,12 +3499,30 @@ def render_tabs(payload: Dict[str, Any]) -> None:
 
 def render_sidebar(saved_properties: List[Dict[str, Any]]) -> None:
     with st.sidebar:
+        workspace_options = ["Property workspace", "Portfolio screener"]
+        if bool(st.session_state.get("authenticated_is_admin")):
+            workspace_options.append("Admin panel")
+        if st.session_state.get("active_page") not in workspace_options:
+            st.session_state["active_page"] = workspace_options[0]
         st.radio(
             "Workspace",
-            options=["Property workspace", "Portfolio screener"],
+            options=workspace_options,
             key="active_page",
             horizontal=False,
         )
+        st.markdown(
+            f"""
+            <div class="pc-sidebar-card" style="margin-bottom:0.85rem;">
+                <div class="pc-mini-title">Signed in</div>
+                <div style="font-size:0.95rem;font-weight:700;color:#0f172a;">{st.session_state.get("authenticated_username", "")}</div>
+                <div class="pc-meta">{st.session_state.get("authenticated_email", "")}</div>
+                <div class="pc-meta" style="margin-top:0.3rem;">{'Admin' if st.session_state.get('authenticated_is_admin') else 'User'}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Logout", use_container_width=True, on_click=logout_user):
+            st.rerun()
         state_groups = grouped_properties(saved_properties)
         favorite_count = sum(1 for item in saved_properties if bool(item.get("is_favorite")))
         st.markdown(
@@ -4003,12 +4155,16 @@ def render_tables(metrics: Dict[str, float | str | List[Loan]], payload: Dict[st
 
 
 def main() -> None:
-    st.set_page_config(page_title="Property Scout", page_icon="🏠", layout="wide")
+    st.set_page_config(page_title="Cashflow Scout", page_icon="🏠", layout="wide")
     init_db()
     ensure_state()
     consume_pending_payload_apply()
     consume_pending_active_page()
     render_analyst_theme()
+
+    if not bool(st.session_state.get("is_authenticated")):
+        render_auth_page()
+        return
 
     saved_properties = list_properties()
     render_sidebar(saved_properties)
@@ -4016,7 +4172,7 @@ def main() -> None:
     st.markdown(
         """
         <div class="pc-shell">
-            <div class="pc-page-title">Property Scout</div>
+            <div class="pc-page-title">Cashflow Scout</div>
             <div class="pc-page-subtitle">
                 Compact analyst workspace for screening Australian residential deals.
                 Import the listing, verify the address and SOI, model the funding, then review the full feasibility pack.
@@ -4026,8 +4182,11 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    if str(st.session_state.get("active_page", "Property workspace")) == "Portfolio screener":
+    active_page = str(st.session_state.get("active_page", "Property workspace"))
+    if active_page == "Portfolio screener":
         render_portfolio_screener_page(saved_properties)
+    elif active_page == "Admin panel" and bool(st.session_state.get("authenticated_is_admin")):
+        render_admin_panel()
     else:
         payload = current_payload()
         render_tabs(payload)

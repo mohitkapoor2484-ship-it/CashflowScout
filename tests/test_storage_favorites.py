@@ -88,6 +88,54 @@ class StorageFavoritesTests(unittest.TestCase):
         self.assertEqual(loaded["portfolio_deposit_mode"], "Dollar")
         self.assertEqual(loaded["portfolio_deposit_value"], 150000)
 
+    def test_default_admin_is_seeded_and_can_authenticate(self) -> None:
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = Path(tmpdir) / "property_check.db"
+            with patch.object(storage, "DB_PATH", db_path):
+                storage.init_db()
+                admin = storage.authenticate_user(
+                    storage.DEFAULT_ADMIN_USERNAME,
+                    storage.DEFAULT_ADMIN_PASSWORD,
+                    require_admin=True,
+                )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        self.assertIsNotNone(admin)
+        self.assertTrue(bool(admin["is_admin"]))
+
+    def test_create_user_and_authenticate_round_trip(self) -> None:
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = Path(tmpdir) / "property_check.db"
+            with patch.object(storage, "DB_PATH", db_path):
+                storage.init_db()
+                created, message = storage.create_user("mohit", "mohit@example.com", "SecurePass1!")
+                user = storage.authenticate_user("mohit", "SecurePass1!")
+                listed_users = storage.list_users()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        self.assertTrue(created, message)
+        self.assertIsNotNone(user)
+        self.assertEqual(user["username"], "mohit")
+        self.assertFalse(bool(user["is_admin"]))
+        self.assertTrue(any(item["username"] == "mohit" for item in listed_users))
+
+    def test_non_admin_cannot_use_admin_login(self) -> None:
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = Path(tmpdir) / "property_check.db"
+            with patch.object(storage, "DB_PATH", db_path):
+                storage.init_db()
+                storage.create_user("member", "member@example.com", "SecurePass1!")
+                admin_attempt = storage.authenticate_user("member", "SecurePass1!", require_admin=True)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        self.assertIsNone(admin_attempt)
+
 
 if __name__ == "__main__":
     unittest.main()

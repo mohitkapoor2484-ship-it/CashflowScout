@@ -36,6 +36,13 @@ def set_state_value(app_test: AppTest, key: str, value) -> None:
     app_test.session_state[key] = value
 
 
+def authenticate_test_session(app_test: AppTest, is_admin: bool = False) -> None:
+    app_test.session_state["is_authenticated"] = True
+    app_test.session_state["authenticated_username"] = "admin" if is_admin else "tester"
+    app_test.session_state["authenticated_email"] = "admin@example.com" if is_admin else "tester@example.com"
+    app_test.session_state["authenticated_is_admin"] = is_admin
+
+
 def portfolio_widget_key(app_test: AppTest, input_key: str) -> str:
     try:
         nonce = int(app_test.session_state["portfolio_widget_nonce"])
@@ -45,6 +52,29 @@ def portfolio_widget_key(app_test: AppTest, input_key: str) -> str:
 
 
 class PropertyCheckIntegrationTests(unittest.TestCase):
+    def test_unauthenticated_users_see_auth_page_only(self) -> None:
+        with patch("statement_lookup.lookup_statement_of_information", return_value=SOI_FAILURE):
+            app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            app_test.run()
+
+        self.assertEqual(len(app_test.exception), 0)
+        self.assertFalse(bool(app_test.session_state["is_authenticated"]))
+        button_labels = [item.label for item in app_test.button]
+        self.assertIn("Login", button_labels)
+        self.assertIn("Create account", button_labels)
+        self.assertIn("Login as admin", button_labels)
+
+    def test_admin_session_can_open_admin_panel(self) -> None:
+        with patch("statement_lookup.lookup_statement_of_information", return_value=SOI_FAILURE):
+            app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test, is_admin=True)
+            set_state_value(app_test, "active_page", "Admin panel")
+            app_test.run()
+
+        self.assertEqual(len(app_test.exception), 0)
+        self.assertEqual(app_test.session_state["active_page"], "Admin panel")
+        self.assertTrue(bool(app_test.session_state["authenticated_is_admin"]))
+
     def test_portfolio_screener_renders_dscr_column(self) -> None:
         saved_properties = [
             {
@@ -71,6 +101,7 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             patch("storage.load_property", return_value=loaded_property),
         ):
             app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
             set_state_value(app_test, "active_page", "Portfolio screener")
             app_test.run()
 
@@ -108,6 +139,7 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             patch("storage.load_property", return_value=loaded_property),
         ):
             app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
             set_state_value(app_test, "active_page", "Portfolio screener")
             app_test.run()
             button(app_test, "Saved One").click().run()
@@ -151,6 +183,7 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             patch("storage.load_setting", return_value=saved_settings),
         ):
             app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
             set_state_value(app_test, "active_page", "Portfolio screener")
             app_test.run()
 
@@ -212,6 +245,7 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             patch("storage.load_setting", return_value=saved_settings),
         ):
             app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
             set_state_value(app_test, "active_page", "Portfolio screener")
             set_state_value(app_test, "_portfolio_settings_loaded", True)
             set_state_value(app_test, portfolio_widget_key(app_test, "portfolio_deposit_value_input"), 0.0)
@@ -268,6 +302,7 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             patch("storage.save_setting") as save_setting_mock,
         ):
             app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
             set_state_value(app_test, "active_page", "Portfolio screener")
             app_test.run()
             set_state_value(app_test, portfolio_widget_key(app_test, "portfolio_deposit_mode_input"), "Dollar")
@@ -319,6 +354,7 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
                 patch("storage.load_property", return_value=loaded_property),
             ):
                 app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+                authenticate_test_session(app_test)
                 set_state_value(app_test, "active_page", "Portfolio screener")
                 app_test.run()
                 set_state_value(app_test, portfolio_widget_key(app_test, "portfolio_deposit_mode_input"), "Dollar")
@@ -370,6 +406,7 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
                 patch("storage.load_property", return_value=loaded_property),
             ):
                 app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+                authenticate_test_session(app_test)
                 set_state_value(app_test, "active_page", "Portfolio screener")
                 app_test.run()
                 set_state_value(
@@ -382,6 +419,7 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
                 loaded_usage = storage.load_setting(app.PORTFOLIO_PM_USAGE_SETTING_KEY, {})
 
                 reloaded_app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+                authenticate_test_session(reloaded_app_test)
                 set_state_value(reloaded_app_test, "active_page", "Portfolio screener")
                 reloaded_app_test.run()
 
@@ -412,7 +450,9 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             patch("storage.list_properties", return_value=saved_properties),
             patch("storage.toggle_property_favorite") as toggle_mock,
         ):
-            app_test = AppTest.from_file(APP_FILE, default_timeout=20).run()
+            app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
+            app_test.run()
             next(item for item in app_test.button if item.label == "☆").click().run()
 
         self.assertEqual(len(app_test.exception), 0)
@@ -432,7 +472,9 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             patch("statement_lookup.lookup_statement_of_information", return_value=SOI_FAILURE),
             patch("storage.list_properties", return_value=saved_properties),
         ):
-            app_test = AppTest.from_file(APP_FILE, default_timeout=20).run()
+            app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
+            app_test.run()
 
         self.assertEqual(len(app_test.exception), 0)
 
@@ -441,7 +483,9 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             patch("statement_lookup.lookup_statement_of_information", return_value=SOI_FAILURE),
             patch("storage.save_property") as save_mock,
         ):
-            app_test = AppTest.from_file(APP_FILE, default_timeout=20).run()
+            app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
+            app_test.run()
             set_state_value(app_test, "facts_editor_draft", pd.DataFrame(
                 [
                     {"": "Property address", " ": "9 Draft Street, Geelong VIC 3220", "  ": ""},
@@ -543,7 +587,9 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             patch("statement_lookup.lookup_statement_of_information", return_value=SOI_FAILURE),
             patch("storage.save_property") as save_mock,
         ):
-            app_test = AppTest.from_file(APP_FILE, default_timeout=20).run()
+            app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
+            app_test.run()
             set_state_value(app_test, "facts_editor_draft", pd.DataFrame(
                 [
                     {"": "Property address", " ": "5 Export Avenue, Ballarat VIC 3350", "  ": ""},
@@ -593,7 +639,9 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
 
     def test_property_details_tab_shows_property_sold_checkbox(self) -> None:
         with patch("statement_lookup.lookup_statement_of_information", return_value=SOI_FAILURE):
-            app_test = AppTest.from_file(APP_FILE, default_timeout=20).run()
+            app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
+            app_test.run()
 
         self.assertEqual(len(app_test.exception), 0)
         checkbox_labels = [item.label for item in app_test.checkbox]
@@ -608,7 +656,9 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             "source_url": "https://example.com/verified-soi.pdf",
         }
         with patch("statement_lookup.lookup_statement_of_information", return_value=soi_success):
-            app_test = AppTest.from_file(APP_FILE, default_timeout=20).run()
+            app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
+            app_test.run()
             address = "1 Example Street, Melbourne VIC 3000"
             set_state_value(app_test, "property_address", address)
             set_state_value(app_test, "last_soi_lookup_address", "")
@@ -626,7 +676,9 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
 
     def test_soi_failure_preserves_same_property_but_clears_on_property_change(self) -> None:
         with patch("statement_lookup.lookup_statement_of_information", return_value=SOI_FAILURE):
-            app_test = AppTest.from_file(APP_FILE, default_timeout=20).run()
+            app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
+            app_test.run()
             original_address = "2 New Street, Melbourne VIC 3000"
             set_state_value(app_test, "property_address", original_address)
             set_state_value(app_test, "last_soi_lookup_address", original_address)
@@ -650,7 +702,9 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
 
     def test_calculate_clears_stale_auto_duty_for_unsupported_state_and_blank_price(self) -> None:
         with patch("statement_lookup.lookup_statement_of_information", return_value=SOI_FAILURE):
-            app_test = AppTest.from_file(APP_FILE, default_timeout=20).run()
+            app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
+            app_test.run()
             set_state_value(app_test, "property_address", "1 Example Street, Melbourne VIC 3000")
             set_state_value(app_test, "price", 700_000.0)
             set_state_value(app_test, "stamp_duty", None)
@@ -684,7 +738,9 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
 
     def test_calculate_auto_populates_qld_stamp_duty(self) -> None:
         with patch("statement_lookup.lookup_statement_of_information", return_value=SOI_FAILURE):
-            app_test = AppTest.from_file(APP_FILE, default_timeout=20).run()
+            app_test = AppTest.from_file(APP_FILE, default_timeout=20)
+            authenticate_test_session(app_test)
+            app_test.run()
             set_state_value(app_test, "property_address", "30 Anderson Court., Moranbah QLD 4744")
             set_state_value(app_test, "price", 540_000.0)
             set_state_value(app_test, "stamp_duty", None)

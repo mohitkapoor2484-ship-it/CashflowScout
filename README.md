@@ -1,4 +1,4 @@
-# Property Scout
+# Cashflow Scout
 
 Streamlit tool for quickly screening an investment property purchase.
 
