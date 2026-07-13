@@ -7,6 +7,7 @@ import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import quote
 
 
 DB_PATH = Path(__file__).with_name("property_check.db")
@@ -24,6 +25,15 @@ _DATABASE_URL_ENV_KEYS = (
     "POSTGRESQL_URL",
     "postgresql_url",
 )
+
+_DATABASE_COMPONENT_KEYS = {
+    "host": ("PGHOST", "POSTGRES_HOST", "DB_HOST", "db_host"),
+    "port": ("PGPORT", "POSTGRES_PORT", "DB_PORT", "db_port"),
+    "database": ("PGDATABASE", "POSTGRES_DB", "DB_NAME", "db_name", "dbname"),
+    "user": ("PGUSER", "POSTGRES_USER", "DB_USER", "db_user"),
+    "password": ("PGPASSWORD", "POSTGRES_PASSWORD", "DB_PASSWORD", "db_password"),
+    "sslmode": ("PGSSLMODE", "POSTGRES_SSLMODE", "DB_SSLMODE", "db_sslmode"),
+}
 
 
 def _load_streamlit_secret(key: str) -> Optional[str]:
@@ -43,15 +53,91 @@ def _load_streamlit_secret(key: str) -> Optional[str]:
     return normalized or None
 
 
+def _load_streamlit_secret_section(key: str) -> Optional[Dict[str, Any]]:
+    try:
+        import streamlit as st
+    except Exception:
+        return None
+
+    try:
+        value = st.secrets.get(key)
+    except Exception:
+        return None
+
+    if value is None:
+        return None
+    try:
+        return dict(value)
+    except Exception:
+        return None
+
+
+def _normalize_database_url(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"'}:
+        normalized = normalized[1:-1].strip()
+    if normalized.startswith("postgres://"):
+        normalized = "postgresql://" + normalized[len("postgres://") :]
+    return normalized or None
+
+
+def _load_database_component_values() -> Dict[str, str]:
+    component_values: Dict[str, str] = {}
+    for field_name, keys in _DATABASE_COMPONENT_KEYS.items():
+        for key in keys:
+            value = os.getenv(key)
+            if value and str(value).strip():
+                component_values[field_name] = str(value).strip()
+                break
+            secret_value = _load_streamlit_secret(key)
+            if secret_value:
+                component_values[field_name] = secret_value
+                break
+
+    for section_name in ("postgres", "database"):
+        section = _load_streamlit_secret_section(section_name)
+        if not section:
+            continue
+        section_keys = {str(key).lower(): value for key, value in section.items()}
+        component_values.setdefault("host", str(section_keys.get("host", "")).strip())
+        component_values.setdefault("port", str(section_keys.get("port", "")).strip())
+        component_values.setdefault("database", str(section_keys.get("database") or section_keys.get("dbname") or "").strip())
+        component_values.setdefault("user", str(section_keys.get("user", "")).strip())
+        component_values.setdefault("password", str(section_keys.get("password", "")).strip())
+        component_values.setdefault("sslmode", str(section_keys.get("sslmode", "")).strip())
+
+    return {key: value for key, value in component_values.items() if value}
+
+
+def _build_database_url_from_components() -> Optional[str]:
+    component_values = _load_database_component_values()
+    required_fields = ("host", "database", "user", "password")
+    if any(not component_values.get(field_name) for field_name in required_fields):
+        return None
+
+    host = component_values["host"]
+    port = component_values.get("port", "5432")
+    database = quote(component_values["database"], safe="")
+    user = quote(component_values["user"], safe="")
+    password = quote(component_values["password"], safe="")
+    sslmode = quote(component_values.get("sslmode", "require"), safe="")
+    return f"postgresql://{user}:{password}@{host}:{port}/{database}?sslmode={sslmode}"
+
+
 def get_database_url() -> Optional[str]:
     for key in _DATABASE_URL_ENV_KEYS:
         value = os.getenv(key)
-        if value and value.strip():
-            return value.strip()
-        secret_value = _load_streamlit_secret(key)
+        normalized = _normalize_database_url(value)
+        if normalized:
+            return normalized
+        secret_value = _normalize_database_url(_load_streamlit_secret(key))
         if secret_value:
             return secret_value
-    return None
+    return _build_database_url_from_components()
 
 
 def using_postgres() -> bool:
@@ -77,8 +163,14 @@ def _get_connection() -> Any:
             raise RuntimeError(
                 "Postgres database support requires psycopg. Add 'psycopg[binary]' to requirements."
             ) from exc
-
-        return connect(get_database_url(), row_factory=dict_row)
+        database_url = get_database_url()
+        try:
+            return connect(database_url, row_factory=dict_row)
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to connect to the configured Postgres database. Check the DATABASE_URL or postgres secrets, "
+                "make sure the password is URL-encoded if it contains special characters, and include sslmode=require."
+            ) from exc
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row

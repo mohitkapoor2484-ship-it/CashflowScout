@@ -23,6 +23,37 @@ class StorageFavoritesTests(unittest.TestCase):
             self.assertEqual(storage.get_database_url(), "postgresql://demo:secret@db.example.com/app")
             self.assertTrue(storage.using_postgres())
 
+    def test_normalizes_quoted_postgres_url(self) -> None:
+        with patch.dict("os.environ", {"DATABASE_URL": ' "postgres://demo:secret@db.example.com/app?sslmode=require" '}), patch.object(
+            storage,
+            "_load_streamlit_secret",
+            return_value=None,
+        ):
+            self.assertEqual(
+                storage.get_database_url(),
+                "postgresql://demo:secret@db.example.com/app?sslmode=require",
+            )
+            self.assertTrue(storage.using_postgres())
+
+    def test_builds_postgres_url_from_streamlit_secret_components(self) -> None:
+        with patch.dict("os.environ", {}, clear=True), patch.object(storage, "_load_streamlit_secret", return_value=None), patch.object(
+            storage,
+            "_load_streamlit_secret_section",
+            return_value={
+                "host": "db.example.com",
+                "port": 5432,
+                "database": "cashflow_scout",
+                "user": "app_user",
+                "password": "P@ss word",
+                "sslmode": "require",
+            },
+        ):
+            self.assertEqual(
+                storage.get_database_url(),
+                "postgresql://app_user:P%40ss%20word@db.example.com:5432/cashflow_scout?sslmode=require",
+            )
+            self.assertTrue(storage.using_postgres())
+
     def test_init_db_adds_favorite_column_to_existing_database(self) -> None:
         tmpdir = tempfile.mkdtemp()
         try:
