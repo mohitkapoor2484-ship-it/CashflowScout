@@ -249,7 +249,7 @@ def ensure_state() -> None:
     for key, input_key in PORTFOLIO_INPUT_KEY_MAP.items():
         st.session_state.setdefault(input_key, st.session_state[key])
     sync_portfolio_transient_inputs()
-    saved_portfolio_settings = load_setting("portfolio_screener_inputs", {})
+    saved_portfolio_settings = cached_setting("portfolio_screener_inputs", {})
     should_restore_portfolio_settings = (
         not st.session_state.get("_portfolio_settings_loaded", False)
         or portfolio_settings_are_blank()
@@ -264,7 +264,7 @@ def ensure_state() -> None:
     else:
         ensure_portfolio_widget_state()
     st.session_state["_portfolio_settings_loaded"] = True
-    saved_portfolio_pm_usage = load_setting(PORTFOLIO_PM_USAGE_SETTING_KEY, {})
+    saved_portfolio_pm_usage = cached_setting(PORTFOLIO_PM_USAGE_SETTING_KEY, {})
     should_restore_portfolio_pm_usage = (
         not st.session_state.get("_portfolio_pm_usage_loaded", False)
         or not st.session_state.get("portfolio_property_manager_usage")
@@ -391,6 +391,8 @@ def set_authenticated_user(user: Dict[str, Any]) -> None:
     st.session_state["authenticated_username"] = str(user.get("username", ""))
     st.session_state["authenticated_email"] = str(user.get("email", ""))
     st.session_state["authenticated_is_admin"] = bool(user.get("is_admin"))
+    invalidate_saved_properties_cache()
+    invalidate_users_cache()
 
 
 def current_username() -> str:
@@ -401,17 +403,73 @@ def current_user_can_view_all_properties() -> bool:
     return bool(st.session_state.get("authenticated_is_admin", False))
 
 
+def invalidate_saved_properties_cache() -> None:
+    st.session_state.pop("_saved_properties_cache", None)
+
+
+def invalidate_users_cache() -> None:
+    st.session_state.pop("_users_cache", None)
+
+
+def invalidate_setting_cache(key: str) -> None:
+    cached = dict(st.session_state.get("_db_setting_cache", {}))
+    cached.pop(key, None)
+    st.session_state["_db_setting_cache"] = cached
+
+
+def cached_setting(key: str, default: Any = None) -> Any:
+    cache = dict(st.session_state.get("_db_setting_cache", {}))
+    if key in cache:
+        return cache[key]
+    value = load_setting(key, default)
+    cache[key] = value
+    st.session_state["_db_setting_cache"] = cache
+    return value
+
+
+def persist_setting(key: str, value: Any) -> None:
+    save_setting(key, value)
+    cache = dict(st.session_state.get("_db_setting_cache", {}))
+    cache[key] = value
+    st.session_state["_db_setting_cache"] = cache
+
+
+def cached_saved_properties() -> List[Dict[str, Any]]:
+    cache = st.session_state.get("_saved_properties_cache")
+    cache_key = (current_username(), current_user_can_view_all_properties())
+    if isinstance(cache, dict) and cache.get("key") == cache_key:
+        return list(cache.get("items", []))
+    items = list_properties(
+        owner_username=current_username(),
+        include_all=current_user_can_view_all_properties(),
+    )
+    st.session_state["_saved_properties_cache"] = {"key": cache_key, "items": list(items)}
+    return items
+
+
+def cached_users() -> List[Dict[str, Any]]:
+    cache = st.session_state.get("_users_cache")
+    if isinstance(cache, list):
+        return list(cache)
+    users = list_users()
+    st.session_state["_users_cache"] = list(users)
+    return users
+
+
 def logout_user() -> None:
     st.session_state["is_authenticated"] = False
     st.session_state["authenticated_username"] = ""
     st.session_state["authenticated_email"] = ""
     st.session_state["authenticated_is_admin"] = False
     st.session_state["active_page"] = "Property workspace"
+    invalidate_saved_properties_cache()
+    invalidate_users_cache()
+    st.session_state["_db_setting_cache"] = {}
     reset_to_defaults()
 
 
 def render_admin_panel() -> None:
-    users = list_users()
+    users = cached_users()
     st.markdown(
         """
         <div class="pc-card" style="margin-bottom:0.9rem;">
@@ -527,6 +585,7 @@ def delete_loaded_property_and_reset() -> None:
             owner_username=current_username(),
             include_all=current_user_can_view_all_properties(),
         )
+        invalidate_saved_properties_cache()
     reset_to_defaults()
 
 
@@ -641,7 +700,7 @@ def apply_portfolio_screener_manager_rate_edits() -> None:
     st.session_state["portfolio_property_manager_usage"] = usage_map
     st.session_state["portfolio_screener_editor_applied_signature"] = signature
     if has_changes:
-        save_setting(PORTFOLIO_PM_USAGE_SETTING_KEY, usage_map)
+        persist_setting(PORTFOLIO_PM_USAGE_SETTING_KEY, usage_map)
 
 
 def current_payload() -> Dict[str, Any]:
@@ -984,6 +1043,7 @@ def render_saved_property_row(item: Dict[str, Any], key_scope: str) -> None:
             owner_username=current_username(),
             include_all=current_user_can_view_all_properties(),
         )
+        invalidate_saved_properties_cache()
         st.rerun()
     if load_col.button(display_label, key=f"load_{key_scope}_{storage_key}", use_container_width=True):
         loaded = load_property(
@@ -2061,10 +2121,7 @@ def deposit_comparison_table(payload: Dict[str, float | str]) -> pd.DataFrame:
 
 def saved_property_comparison_table() -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    items = list_properties(
-        owner_username=current_username(),
-        include_all=current_user_can_view_all_properties(),
-    )
+    items = cached_saved_properties()
     saved_map = resolve_saved_property_map(items)
     for item in items:
         saved = saved_map.get(str(item.get("storage_key", item["name"])))
@@ -2312,7 +2369,7 @@ def save_portfolio_screener_inputs(shared: Dict[str, Any]) -> None:
         "portfolio_maintenance_allowance_pct": shared["maintenance_allowance_pct"],
         "portfolio_income_tax_rate": shared["income_tax_rate"],
     }
-    save_setting("portfolio_screener_inputs", payload)
+    persist_setting("portfolio_screener_inputs", payload)
 
 
 def persist_portfolio_screener_inputs() -> None:
@@ -3557,6 +3614,7 @@ def render_tabs(payload: Dict[str, Any]) -> None:
                     payload=export_payload,
                     owner_username=current_username(),
                 )
+                invalidate_saved_properties_cache()
                 queue_payload_apply(
                     export_payload,
                     save_name,
@@ -3643,6 +3701,7 @@ def render_sidebar(saved_properties: List[Dict[str, Any]]) -> None:
                         payload=sidebar_payload,
                         owner_username=current_username(),
                     )
+                    invalidate_saved_properties_cache()
                     queue_payload_apply(
                         sidebar_payload,
                         save_name,
@@ -4254,10 +4313,7 @@ def main() -> None:
         render_auth_page()
         return
 
-    saved_properties = list_properties(
-        owner_username=current_username(),
-        include_all=current_user_can_view_all_properties(),
-    )
+    saved_properties = cached_saved_properties()
     render_sidebar(saved_properties)
 
     st.markdown(
