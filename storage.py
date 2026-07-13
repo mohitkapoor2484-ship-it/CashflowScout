@@ -5,9 +5,11 @@ import hmac
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 
 DB_PATH = Path(__file__).with_name("property_check.db")
@@ -34,6 +36,28 @@ _DATABASE_COMPONENT_KEYS = {
     "password": ("PGPASSWORD", "POSTGRES_PASSWORD", "DB_PASSWORD", "db_password"),
     "sslmode": ("PGSSLMODE", "POSTGRES_SSLMODE", "DB_SSLMODE", "db_sslmode"),
 }
+
+_PLACEHOLDER_VALUES = {
+    "host",
+    "hostname",
+    "port",
+    "database",
+    "dbname",
+    "db_name",
+    "user",
+    "username",
+    "password",
+    "pass",
+    "postgres_host",
+    "postgres_db",
+    "postgres_user",
+    "postgres_password",
+}
+
+_INIT_LOCK = Lock()
+_INIT_TARGET: Optional[str] = None
+_POSTGRES_POOL: Any = None
+_POSTGRES_POOL_TARGET: Optional[str] = None
 
 
 def _load_streamlit_secret(key: str) -> Optional[str]:
@@ -85,6 +109,13 @@ def _normalize_database_url(value: Any) -> Optional[str]:
     return normalized or None
 
 
+def _looks_like_placeholder(value: Any) -> bool:
+    normalized = str(value or "").strip().strip("'\"").lower()
+    if not normalized:
+        return False
+    return normalized in _PLACEHOLDER_VALUES
+
+
 def _load_database_component_values() -> Dict[str, str]:
     component_values: Dict[str, str] = {}
     for field_name, keys in _DATABASE_COMPONENT_KEYS.items():
@@ -128,6 +159,35 @@ def _build_database_url_from_components() -> Optional[str]:
     return f"postgresql://{user}:{password}@{host}:{port}/{database}?sslmode={sslmode}"
 
 
+def validate_database_configuration() -> None:
+    database_url = get_database_url()
+    if not database_url:
+        return
+
+    parsed = urlparse(database_url)
+    hostname = parsed.hostname or ""
+    database_name = parsed.path.lstrip("/") if parsed.path else ""
+    username = parsed.username or ""
+    password = parsed.password or ""
+
+    placeholder_fields: List[str] = []
+    if _looks_like_placeholder(hostname):
+        placeholder_fields.append("host")
+    if _looks_like_placeholder(database_name):
+        placeholder_fields.append("database")
+    if _looks_like_placeholder(username):
+        placeholder_fields.append("user")
+    if _looks_like_placeholder(password):
+        placeholder_fields.append("password")
+
+    if placeholder_fields:
+        raise RuntimeError(
+            "Database configuration is using placeholder values for: "
+            + ", ".join(placeholder_fields)
+            + ". Replace the sample values in Streamlit secrets with your real Postgres connection details."
+        )
+
+
 def get_database_url() -> Optional[str]:
     for key in _DATABASE_URL_ENV_KEYS:
         value = os.getenv(key)
@@ -148,12 +208,47 @@ def using_postgres() -> bool:
     return normalized.startswith("postgres://") or normalized.startswith("postgresql://")
 
 
+def _database_target() -> str:
+    return get_database_url() or str(DB_PATH)
+
+
 def _prepare_sql(query: str) -> str:
     if using_postgres():
         return query.replace("?", "%s")
     return query
 
 
+def _get_postgres_pool() -> Any:
+    global _POSTGRES_POOL, _POSTGRES_POOL_TARGET
+    database_url = get_database_url()
+    if not database_url:
+        return None
+    if _POSTGRES_POOL is not None and _POSTGRES_POOL_TARGET == database_url:
+        return _POSTGRES_POOL
+    try:
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+    except ImportError:
+        return None
+
+    if _POSTGRES_POOL is not None and _POSTGRES_POOL_TARGET != database_url:
+        try:
+            _POSTGRES_POOL.close()
+        except Exception:
+            pass
+
+    _POSTGRES_POOL = ConnectionPool(
+        conninfo=database_url,
+        min_size=1,
+        max_size=6,
+        kwargs={"row_factory": dict_row},
+        open=True,
+    )
+    _POSTGRES_POOL_TARGET = database_url
+    return _POSTGRES_POOL
+
+
+@contextmanager
 def _get_connection() -> Any:
     if using_postgres():
         try:
@@ -163,9 +258,23 @@ def _get_connection() -> Any:
             raise RuntimeError(
                 "Postgres database support requires psycopg. Add 'psycopg[binary]' to requirements."
             ) from exc
+        validate_database_configuration()
         database_url = get_database_url()
+        pool = _get_postgres_pool()
+        if pool is not None:
+            try:
+                with pool.connection() as conn:
+                    yield conn
+                return
+            except Exception as exc:
+                raise RuntimeError(
+                    "Unable to connect to the configured Postgres database. Check the DATABASE_URL or postgres secrets, "
+                    "make sure the password is URL-encoded if it contains special characters, and include sslmode=require."
+                ) from exc
         try:
-            return connect(database_url, row_factory=dict_row)
+            with connect(database_url, row_factory=dict_row) as conn:
+                yield conn
+            return
         except Exception as exc:
             raise RuntimeError(
                 "Unable to connect to the configured Postgres database. Check the DATABASE_URL or postgres secrets, "
@@ -174,7 +283,10 @@ def _get_connection() -> Any:
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def _execute(conn: Any, query: str, params: Iterable[Any] = ()) -> Any:
@@ -223,127 +335,153 @@ def _is_integrity_error(exc: Exception) -> bool:
 
 
 def init_db() -> None:
-    with _get_connection() as conn:
-        _execute(
-            conn,
-            """
-            CREATE TABLE IF NOT EXISTS properties (
-                name TEXT PRIMARY KEY,
-                address TEXT NOT NULL,
-                state TEXT NOT NULL,
-                is_favorite INTEGER NOT NULL DEFAULT 0,
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """,
-        )
+    global _INIT_TARGET
+    current_target = _database_target()
+    if _INIT_TARGET == current_target:
+        return
 
-        columns = _list_columns(conn, "properties")
-        if "is_favorite" not in columns:
-            _execute(conn, "ALTER TABLE properties ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
-        if "owner_username" not in columns:
-            _execute(conn, "ALTER TABLE properties ADD COLUMN owner_username TEXT")
-        if "display_name" not in columns:
-            _execute(conn, "ALTER TABLE properties ADD COLUMN display_name TEXT")
+    with _INIT_LOCK:
+        current_target = _database_target()
+        if _INIT_TARGET == current_target:
+            return
 
-        _execute(
-            conn,
-            "UPDATE properties SET owner_username = COALESCE(NULLIF(owner_username, ''), ?)",
-            (LEGACY_PROPERTY_OWNER,),
-        )
-
-        if using_postgres():
+        with _get_connection() as conn:
             _execute(
                 conn,
                 """
-                UPDATE properties
-                SET display_name = CASE
-                    WHEN display_name IS NULL OR display_name = '' THEN
-                        CASE
-                            WHEN position('::' in name) > 0 THEN substring(name from position('::' in name) + 2)
-                            ELSE name
-                        END
-                    ELSE display_name
-                END
+                CREATE TABLE IF NOT EXISTS properties (
+                    name TEXT PRIMARY KEY,
+                    address TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    is_favorite INTEGER NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
                 """,
             )
-            legacy_rows = _fetchall(
-                _execute(
-                    conn,
-                    """
-                    SELECT name, owner_username, display_name
-                    FROM properties
-                    WHERE position('::' in name) = 0
-                    """,
-                )
+
+            columns = _list_columns(conn, "properties")
+            if "is_favorite" not in columns:
+                _execute(conn, "ALTER TABLE properties ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
+            if "owner_username" not in columns:
+                _execute(conn, "ALTER TABLE properties ADD COLUMN owner_username TEXT")
+            if "display_name" not in columns:
+                _execute(conn, "ALTER TABLE properties ADD COLUMN display_name TEXT")
+
+            _execute(
+                conn,
+                "UPDATE properties SET owner_username = COALESCE(NULLIF(owner_username, ''), ?)",
+                (LEGACY_PROPERTY_OWNER,),
             )
-        else:
+
             _execute(
                 conn,
                 """
-                UPDATE properties
-                SET display_name = CASE
-                    WHEN display_name IS NULL OR display_name = '' THEN
-                        CASE
-                            WHEN instr(name, '::') > 0 THEN substr(name, instr(name, '::') + 2)
-                            ELSE name
-                        END
-                    ELSE display_name
-                END
+                CREATE INDEX IF NOT EXISTS idx_properties_owner_updated
+                ON properties (owner_username, updated_at DESC)
                 """,
             )
-            legacy_rows = _fetchall(
+
+            if using_postgres():
                 _execute(
                     conn,
                     """
-                    SELECT name, owner_username, display_name
-                    FROM properties
-                    WHERE instr(name, '::') = 0
+                    UPDATE properties
+                    SET display_name = CASE
+                        WHEN display_name IS NULL OR display_name = '' THEN
+                            CASE
+                                WHEN position('::' in name) > 0 THEN substring(name from position('::' in name) + 2)
+                                ELSE name
+                            END
+                        ELSE display_name
+                    END
                     """,
                 )
-            )
+                legacy_rows = _fetchall(
+                    _execute(
+                        conn,
+                        """
+                        SELECT name, owner_username, display_name
+                        FROM properties
+                        WHERE position('::' in name) = 0
+                        """,
+                    )
+                )
+            else:
+                _execute(
+                    conn,
+                    """
+                    UPDATE properties
+                    SET display_name = CASE
+                        WHEN display_name IS NULL OR display_name = '' THEN
+                            CASE
+                                WHEN instr(name, '::') > 0 THEN substr(name, instr(name, '::') + 2)
+                                ELSE name
+                            END
+                        ELSE display_name
+                    END
+                    """,
+                )
+                legacy_rows = _fetchall(
+                    _execute(
+                        conn,
+                        """
+                        SELECT name, owner_username, display_name
+                        FROM properties
+                        WHERE instr(name, '::') = 0
+                        """,
+                    )
+                )
 
-        for row in legacy_rows:
+            for row in legacy_rows:
+                _execute(
+                    conn,
+                    "UPDATE properties SET name = ? WHERE name = ?",
+                    (_property_storage_key(str(row["owner_username"]), str(row["display_name"])), row["name"]),
+                )
+
             _execute(
                 conn,
-                "UPDATE properties SET name = ? WHERE name = ?",
-                (_property_storage_key(str(row["owner_username"]), str(row["display_name"])), row["name"]),
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_properties_owner_display_name
+                ON properties (owner_username, display_name)
+                """,
             )
-
-        _execute(
-            conn,
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_properties_owner_display_name
-            ON properties (owner_username, display_name)
-            """,
-        )
-        _execute(
-            conn,
-            """
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key TEXT PRIMARY KEY,
-                value_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """,
             )
-            """,
-        )
-        _execute(
-            conn,
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                username TEXT PRIMARY KEY,
-                email TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                password_salt TEXT NOT NULL,
-                is_admin INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    password_salt TEXT NOT NULL,
+                    is_admin INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """,
             )
-            """,
-        )
-        _ensure_default_admin(conn)
-        conn.commit()
+            _execute(
+                conn,
+                """
+                CREATE INDEX IF NOT EXISTS idx_users_lookup
+                ON users (username, email)
+                """,
+            )
+            _ensure_default_admin(conn)
+            conn.commit()
+        _INIT_TARGET = current_target
 
 
 def _hash_password(password: str, salt: str) -> str:
@@ -509,6 +647,67 @@ def load_property(
         "payload": json.loads(row["payload_json"]),
         "updated_at": row["updated_at"],
     }
+
+
+def load_properties(
+    names: List[str],
+    owner_username: Optional[str] = None,
+    include_all: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    lookup_values = [str(name).strip() for name in names if str(name).strip()]
+    if not lookup_values:
+        return {}
+
+    storage_keys = [value for value in lookup_values if "::" in value]
+    display_names = [value for value in lookup_values if "::" not in value]
+    clauses: List[str] = []
+    params: List[Any] = []
+
+    if storage_keys:
+        placeholders = ", ".join("?" for _ in storage_keys)
+        clauses.append(f"name IN ({placeholders})")
+        params.extend(storage_keys)
+
+    if display_names:
+        placeholders = ", ".join("?" for _ in display_names)
+        if include_all:
+            clauses.append(f"display_name IN ({placeholders})")
+            params.extend(display_names)
+        else:
+            scoped_owner = (owner_username or LEGACY_PROPERTY_OWNER).strip()
+            clauses.append(f"(display_name IN ({placeholders}) AND owner_username = ?)")
+            params.extend(display_names)
+            params.append(scoped_owner)
+
+    if not clauses:
+        return {}
+
+    with _get_connection() as conn:
+        rows = _fetchall(
+            _execute(
+                conn,
+                """
+                SELECT name, display_name, owner_username, address, state, is_favorite, payload_json, updated_at
+                FROM properties
+                WHERE """
+                + " OR ".join(clauses),
+                params,
+            )
+        )
+
+    loaded: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        loaded[str(row["name"])] = {
+            "name": row["display_name"],
+            "storage_key": row["name"],
+            "owner_username": row["owner_username"],
+            "address": row["address"],
+            "state": row["state"],
+            "is_favorite": bool(row["is_favorite"]),
+            "payload": json.loads(row["payload_json"]),
+            "updated_at": row["updated_at"],
+        }
+    return loaded
 
 
 def delete_property(

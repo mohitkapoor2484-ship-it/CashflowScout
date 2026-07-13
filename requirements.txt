@@ -4,3 +4,4 @@ plotly>=5.24
 pypdf>=5.4
 reportlab>=4.2
 psycopg[binary]>=3.2
+psycopg-pool>=3.2

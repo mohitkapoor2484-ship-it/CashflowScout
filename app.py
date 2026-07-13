@@ -28,6 +28,7 @@ from storage import (
     list_properties,
     list_users,
     load_property,
+    load_properties,
     load_setting,
     save_property,
     save_setting,
@@ -2060,15 +2061,13 @@ def deposit_comparison_table(payload: Dict[str, float | str]) -> pd.DataFrame:
 
 def saved_property_comparison_table() -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    for item in list_properties(
+    items = list_properties(
         owner_username=current_username(),
         include_all=current_user_can_view_all_properties(),
-    ):
-        saved = load_property(
-            str(item.get("storage_key", item["name"])),
-            owner_username=current_username(),
-            include_all=current_user_can_view_all_properties(),
-        )
+    )
+    saved_map = resolve_saved_property_map(items)
+    for item in items:
+        saved = saved_map.get(str(item.get("storage_key", item["name"])))
         if saved is None:
             continue
         payload = dict(DEFAULTS)
@@ -2188,6 +2187,28 @@ def build_portfolio_screening_payload(
     return payload
 
 
+def resolve_saved_property_map(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    lookup_keys = [str(item.get("storage_key", item["name"])) for item in items]
+    saved_map = load_properties(
+        lookup_keys,
+        owner_username=current_username(),
+        include_all=current_user_can_view_all_properties(),
+    )
+    if saved_map or not items:
+        return saved_map
+
+    fallback_map: Dict[str, Dict[str, Any]] = {}
+    for item, lookup_key in zip(items, lookup_keys):
+        saved = load_property(
+            lookup_key,
+            owner_username=current_username(),
+            include_all=current_user_can_view_all_properties(),
+        )
+        if saved is not None:
+            fallback_map[str(item.get("storage_key", item["name"]))] = saved
+    return fallback_map
+
+
 def portfolio_screening_table(
     saved_properties: List[Dict[str, Any]],
     shared: Dict[str, Any],
@@ -2195,12 +2216,9 @@ def portfolio_screening_table(
 ) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     usage_map = property_manager_usage or {}
+    saved_map = resolve_saved_property_map(saved_properties)
     for item in saved_properties:
-        saved = load_property(
-            str(item.get("storage_key", item["name"])),
-            owner_username=current_username(),
-            include_all=current_user_can_view_all_properties(),
-        )
+        saved = saved_map.get(str(item.get("storage_key", item["name"])))
         if saved is None:
             continue
         property_name = str(item["name"])
