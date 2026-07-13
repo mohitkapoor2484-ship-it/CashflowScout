@@ -9,6 +9,20 @@ import storage
 
 
 class StorageFavoritesTests(unittest.TestCase):
+    def test_uses_sqlite_when_database_url_is_not_configured(self) -> None:
+        with patch.dict("os.environ", {}, clear=True), patch.object(storage, "_load_streamlit_secret", return_value=None):
+            self.assertIsNone(storage.get_database_url())
+            self.assertFalse(storage.using_postgres())
+
+    def test_reads_postgres_database_url_from_environment(self) -> None:
+        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://demo:secret@db.example.com/app"}), patch.object(
+            storage,
+            "_load_streamlit_secret",
+            return_value=None,
+        ):
+            self.assertEqual(storage.get_database_url(), "postgresql://demo:secret@db.example.com/app")
+            self.assertTrue(storage.using_postgres())
+
     def test_init_db_adds_favorite_column_to_existing_database(self) -> None:
         tmpdir = tempfile.mkdtemp()
         try:

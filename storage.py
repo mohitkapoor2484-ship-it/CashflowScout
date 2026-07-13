@@ -6,7 +6,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 
 DB_PATH = Path(__file__).with_name("property_check.db")
@@ -14,16 +14,126 @@ DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "ChangeMe123!"
 LEGACY_PROPERTY_OWNER = "mohitkapoor2484"
 
+_DATABASE_URL_ENV_KEYS = (
+    "DATABASE_URL",
+    "database_url",
+    "SUPABASE_DB_URL",
+    "supabase_db_url",
+    "POSTGRES_URL",
+    "postgres_url",
+    "POSTGRESQL_URL",
+    "postgresql_url",
+)
 
-def _get_connection() -> sqlite3.Connection:
+
+def _load_streamlit_secret(key: str) -> Optional[str]:
+    try:
+        import streamlit as st
+    except Exception:
+        return None
+
+    try:
+        value = st.secrets.get(key)
+    except Exception:
+        return None
+
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def get_database_url() -> Optional[str]:
+    for key in _DATABASE_URL_ENV_KEYS:
+        value = os.getenv(key)
+        if value and value.strip():
+            return value.strip()
+        secret_value = _load_streamlit_secret(key)
+        if secret_value:
+            return secret_value
+    return None
+
+
+def using_postgres() -> bool:
+    database_url = get_database_url()
+    if not database_url:
+        return False
+    normalized = database_url.lower()
+    return normalized.startswith("postgres://") or normalized.startswith("postgresql://")
+
+
+def _prepare_sql(query: str) -> str:
+    if using_postgres():
+        return query.replace("?", "%s")
+    return query
+
+
+def _get_connection() -> Any:
+    if using_postgres():
+        try:
+            from psycopg import connect
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError(
+                "Postgres database support requires psycopg. Add 'psycopg[binary]' to requirements."
+            ) from exc
+
+        return connect(get_database_url(), row_factory=dict_row)
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def _execute(conn: Any, query: str, params: Iterable[Any] = ()) -> Any:
+    return conn.execute(_prepare_sql(query), tuple(params))
+
+
+def _fetchall(cursor: Any) -> List[Dict[str, Any]]:
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+def _fetchone(cursor: Any) -> Optional[Dict[str, Any]]:
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def _list_columns(conn: Any, table_name: str) -> set[str]:
+    if using_postgres():
+        rows = _fetchall(
+            _execute(
+                conn,
+                """
+                SELECT column_name AS name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = ?
+                """,
+                (table_name,),
+            )
+        )
+        return {str(row["name"]) for row in rows}
+
+    rows = _fetchall(_execute(conn, f"PRAGMA table_info({table_name})"))
+    return {str(row["name"]) for row in rows}
+
+
+def _is_integrity_error(exc: Exception) -> bool:
+    if isinstance(exc, sqlite3.IntegrityError):
+        return True
+    try:
+        from psycopg import IntegrityError as PsycopgIntegrityError
+    except ImportError:
+        return False
+    return isinstance(exc, PsycopgIntegrityError)
+
+
 def init_db() -> None:
     with _get_connection() as conn:
-        conn.execute(
+        _execute(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS properties (
                 name TEXT PRIMARY KEY,
@@ -34,60 +144,100 @@ def init_db() -> None:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
-            """
+            """,
         )
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(properties)").fetchall()}
+
+        columns = _list_columns(conn, "properties")
         if "is_favorite" not in columns:
-            conn.execute("ALTER TABLE properties ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
+            _execute(conn, "ALTER TABLE properties ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
         if "owner_username" not in columns:
-            conn.execute("ALTER TABLE properties ADD COLUMN owner_username TEXT")
+            _execute(conn, "ALTER TABLE properties ADD COLUMN owner_username TEXT")
         if "display_name" not in columns:
-            conn.execute("ALTER TABLE properties ADD COLUMN display_name TEXT")
-        conn.execute(
+            _execute(conn, "ALTER TABLE properties ADD COLUMN display_name TEXT")
+
+        _execute(
+            conn,
             "UPDATE properties SET owner_username = COALESCE(NULLIF(owner_username, ''), ?)",
             (LEGACY_PROPERTY_OWNER,),
         )
-        conn.execute(
-            """
-            UPDATE properties
-            SET display_name = CASE
-                WHEN display_name IS NULL OR display_name = '' THEN
-                    CASE
-                        WHEN instr(name, '::') > 0 THEN substr(name, instr(name, '::') + 2)
-                        ELSE name
-                    END
-                ELSE display_name
-            END
-            """
-        )
-        legacy_rows = conn.execute(
-            """
-            SELECT name, owner_username, display_name
-            FROM properties
-            WHERE instr(name, '::') = 0
-            """
-        ).fetchall()
-        for row in legacy_rows:
-            conn.execute(
-                "UPDATE properties SET name = ? WHERE name = ?",
-                (_property_storage_key(row["owner_username"], row["display_name"]), row["name"]),
+
+        if using_postgres():
+            _execute(
+                conn,
+                """
+                UPDATE properties
+                SET display_name = CASE
+                    WHEN display_name IS NULL OR display_name = '' THEN
+                        CASE
+                            WHEN position('::' in name) > 0 THEN substring(name from position('::' in name) + 2)
+                            ELSE name
+                        END
+                    ELSE display_name
+                END
+                """,
             )
-        conn.execute(
+            legacy_rows = _fetchall(
+                _execute(
+                    conn,
+                    """
+                    SELECT name, owner_username, display_name
+                    FROM properties
+                    WHERE position('::' in name) = 0
+                    """,
+                )
+            )
+        else:
+            _execute(
+                conn,
+                """
+                UPDATE properties
+                SET display_name = CASE
+                    WHEN display_name IS NULL OR display_name = '' THEN
+                        CASE
+                            WHEN instr(name, '::') > 0 THEN substr(name, instr(name, '::') + 2)
+                            ELSE name
+                        END
+                    ELSE display_name
+                END
+                """,
+            )
+            legacy_rows = _fetchall(
+                _execute(
+                    conn,
+                    """
+                    SELECT name, owner_username, display_name
+                    FROM properties
+                    WHERE instr(name, '::') = 0
+                    """,
+                )
+            )
+
+        for row in legacy_rows:
+            _execute(
+                conn,
+                "UPDATE properties SET name = ? WHERE name = ?",
+                (_property_storage_key(str(row["owner_username"]), str(row["display_name"])), row["name"]),
+            )
+
+        _execute(
+            conn,
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_properties_owner_display_name
             ON properties (owner_username, display_name)
-            """
+            """,
         )
-        conn.execute(
+        _execute(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
-            """
+            """,
         )
-        conn.execute(
+        _execute(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
@@ -98,9 +248,10 @@ def init_db() -> None:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
-            """
+            """,
         )
         _ensure_default_admin(conn)
+        conn.commit()
 
 
 def _hash_password(password: str, salt: str) -> str:
@@ -117,14 +268,18 @@ def _build_password_record(password: str) -> tuple[str, str]:
     return salt, _hash_password(password, salt)
 
 
-def _ensure_default_admin(conn: sqlite3.Connection) -> None:
-    row = conn.execute(
-        "SELECT username FROM users WHERE is_admin = 1 LIMIT 1"
-    ).fetchone()
+def _ensure_default_admin(conn: Any) -> None:
+    row = _fetchone(
+        _execute(
+            conn,
+            "SELECT username FROM users WHERE is_admin = 1 LIMIT 1",
+        )
+    )
     if row is not None:
         return
     salt, password_hash = _build_password_record(DEFAULT_ADMIN_PASSWORD)
-    conn.execute(
+    _execute(
+        conn,
         """
         INSERT INTO users (username, email, password_hash, password_salt, is_admin, created_at, updated_at)
         VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
@@ -167,7 +322,8 @@ def save_property(
     scoped_owner = owner_username.strip() or LEGACY_PROPERTY_OWNER
     storage_key = _property_storage_key(scoped_owner, display_name)
     with _get_connection() as conn:
-        conn.execute(
+        _execute(
+            conn,
             """
             INSERT INTO properties (name, display_name, owner_username, address, state, is_favorite, payload_json, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
@@ -181,6 +337,7 @@ def save_property(
             """,
             (storage_key, display_name, scoped_owner, address, state, json.dumps(payload)),
         )
+        conn.commit()
 
 
 def list_properties(
@@ -189,39 +346,45 @@ def list_properties(
 ) -> List[Dict[str, Any]]:
     with _get_connection() as conn:
         if include_all:
-            rows = conn.execute(
-                """
-                SELECT
-                    name AS storage_key,
-                    display_name AS name,
-                    owner_username,
-                    address,
-                    state,
-                    is_favorite,
-                    updated_at
-                FROM properties
-                ORDER BY owner_username ASC, is_favorite DESC, state ASC, updated_at DESC, display_name ASC
-                """
-            ).fetchall()
+            rows = _fetchall(
+                _execute(
+                    conn,
+                    """
+                    SELECT
+                        name AS storage_key,
+                        display_name AS name,
+                        owner_username,
+                        address,
+                        state,
+                        is_favorite,
+                        updated_at
+                    FROM properties
+                    ORDER BY owner_username ASC, is_favorite DESC, state ASC, updated_at DESC, display_name ASC
+                    """,
+                )
+            )
         else:
             scoped_owner = (owner_username or LEGACY_PROPERTY_OWNER).strip()
-            rows = conn.execute(
-                """
-                SELECT
-                    name AS storage_key,
-                    display_name AS name,
-                    owner_username,
-                    address,
-                    state,
-                    is_favorite,
-                    updated_at
-                FROM properties
-                WHERE owner_username = ?
-                ORDER BY is_favorite DESC, state ASC, updated_at DESC, display_name ASC
-                """,
-                (scoped_owner,),
-            ).fetchall()
-    return [dict(row) for row in rows]
+            rows = _fetchall(
+                _execute(
+                    conn,
+                    """
+                    SELECT
+                        name AS storage_key,
+                        display_name AS name,
+                        owner_username,
+                        address,
+                        state,
+                        is_favorite,
+                        updated_at
+                    FROM properties
+                    WHERE owner_username = ?
+                    ORDER BY is_favorite DESC, state ASC, updated_at DESC, display_name ASC
+                    """,
+                    (scoped_owner,),
+                )
+            )
+    return rows
 
 
 def load_property(
@@ -231,14 +394,17 @@ def load_property(
 ) -> Optional[Dict[str, Any]]:
     where_clause, params = _property_lookup_clause(name, owner_username, include_all)
     with _get_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT name, display_name, owner_username, address, state, is_favorite, payload_json, updated_at
-            FROM properties
-            WHERE """ + where_clause + """
-            """,
-            params,
-        ).fetchone()
+        row = _fetchone(
+            _execute(
+                conn,
+                """
+                SELECT name, display_name, owner_username, address, state, is_favorite, payload_json, updated_at
+                FROM properties
+                WHERE """
+                + where_clause,
+                params,
+            )
+        )
     if row is None:
         return None
     return {
@@ -260,7 +426,8 @@ def delete_property(
 ) -> None:
     where_clause, params = _property_lookup_clause(name, owner_username, include_all)
     with _get_connection() as conn:
-        conn.execute("DELETE FROM properties WHERE " + where_clause, params)
+        _execute(conn, "DELETE FROM properties WHERE " + where_clause, params)
+        conn.commit()
 
 
 def toggle_property_favorite(
@@ -270,23 +437,29 @@ def toggle_property_favorite(
 ) -> Optional[bool]:
     where_clause, params = _property_lookup_clause(name, owner_username, include_all)
     with _get_connection() as conn:
-        row = conn.execute(
-            "SELECT name, is_favorite FROM properties WHERE " + where_clause,
-            params,
-        ).fetchone()
+        row = _fetchone(
+            _execute(
+                conn,
+                "SELECT name, is_favorite FROM properties WHERE " + where_clause,
+                params,
+            )
+        )
         if row is None:
             return None
         new_value = 0 if bool(row["is_favorite"]) else 1
-        conn.execute(
+        _execute(
+            conn,
             "UPDATE properties SET is_favorite = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?",
             (new_value, row["name"]),
         )
+        conn.commit()
     return bool(new_value)
 
 
 def save_setting(key: str, value: Any) -> None:
     with _get_connection() as conn:
-        conn.execute(
+        _execute(
+            conn,
             """
             INSERT INTO app_settings (key, value_json, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
@@ -296,14 +469,18 @@ def save_setting(key: str, value: Any) -> None:
             """,
             (key, json.dumps(value)),
         )
+        conn.commit()
 
 
 def load_setting(key: str, default: Any = None) -> Any:
     with _get_connection() as conn:
-        row = conn.execute(
-            "SELECT value_json FROM app_settings WHERE key = ?",
-            (key,),
-        ).fetchone()
+        row = _fetchone(
+            _execute(
+                conn,
+                "SELECT value_json FROM app_settings WHERE key = ?",
+                (key,),
+            )
+        )
     if row is None:
         return default
     try:
@@ -325,7 +502,8 @@ def create_user(username: str, email: str, password: str, is_admin: bool = False
     salt, password_hash = _build_password_record(password)
     try:
         with _get_connection() as conn:
-            conn.execute(
+            _execute(
+                conn,
                 """
                 INSERT INTO users (username, email, password_hash, password_salt, is_admin, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
@@ -338,8 +516,11 @@ def create_user(username: str, email: str, password: str, is_admin: bool = False
                     1 if is_admin else 0,
                 ),
             )
-    except sqlite3.IntegrityError:
-        return False, "That username or email is already registered."
+            conn.commit()
+    except Exception as exc:
+        if _is_integrity_error(exc):
+            return False, "That username or email is already registered."
+        raise
 
     return True, "Account created successfully."
 
@@ -350,15 +531,18 @@ def authenticate_user(login: str, password: str, require_admin: bool = False) ->
         return None
 
     with _get_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT username, email, password_hash, password_salt, is_admin, created_at, updated_at
-            FROM users
-            WHERE lower(username) = lower(?) OR lower(email) = lower(?)
-            LIMIT 1
-            """,
-            (normalized_login, normalized_login),
-        ).fetchone()
+        row = _fetchone(
+            _execute(
+                conn,
+                """
+                SELECT username, email, password_hash, password_salt, is_admin, created_at, updated_at
+                FROM users
+                WHERE lower(username) = lower(?) OR lower(email) = lower(?)
+                LIMIT 1
+                """,
+                (normalized_login, normalized_login),
+            )
+        )
     if row is None:
         return None
     if require_admin and not bool(row["is_admin"]):
@@ -379,13 +563,16 @@ def authenticate_user(login: str, password: str, require_admin: bool = False) ->
 
 def list_users() -> List[Dict[str, Any]]:
     with _get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT username, email, is_admin, created_at, updated_at
-            FROM users
-            ORDER BY is_admin DESC, username ASC
-            """
-        ).fetchall()
+        rows = _fetchall(
+            _execute(
+                conn,
+                """
+                SELECT username, email, is_admin, created_at, updated_at
+                FROM users
+                ORDER BY is_admin DESC, username ASC
+                """,
+            )
+        )
     return [
         {
             "username": row["username"],
