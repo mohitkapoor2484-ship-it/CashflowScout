@@ -20,6 +20,7 @@ from statement_lookup import extract_statement_pdf, lookup_statement_of_informat
 from storage import (
     DEFAULT_ADMIN_PASSWORD,
     DEFAULT_ADMIN_USERNAME,
+    LEGACY_PROPERTY_OWNER,
     authenticate_user,
     create_user,
     delete_property,
@@ -217,6 +218,7 @@ def ensure_state() -> None:
     st.session_state.setdefault("save_name", "")
     st.session_state.setdefault("save_name_input", st.session_state.save_name)
     st.session_state.setdefault("loaded_property_name", "")
+    st.session_state.setdefault("loaded_property_storage_key", "")
     st.session_state.setdefault("last_soi_lookup_address", "")
     st.session_state.setdefault("address_search_query", "")
     st.session_state.setdefault("address_search_results", [])
@@ -307,6 +309,7 @@ def reset_to_defaults() -> None:
     st.session_state.save_name = ""
     st.session_state.save_name_input = ""
     st.session_state.loaded_property_name = ""
+    st.session_state.loaded_property_storage_key = ""
     st.session_state.last_soi_lookup_address = ""
     st.session_state.stamp_duty_auto_signature = ""
     st.session_state.has_calculated = False
@@ -317,11 +320,13 @@ def reset_to_defaults() -> None:
 def queue_payload_apply(
     payload: Dict[str, Any],
     property_name: str,
+    storage_key: str = "",
     preserve_calculation: bool = False,
 ) -> None:
     st.session_state["_pending_payload_apply"] = {
         "payload": dict(payload),
         "property_name": property_name,
+        "storage_key": storage_key,
         "preserve_calculation": preserve_calculation,
     }
 
@@ -329,6 +334,7 @@ def queue_payload_apply(
 def apply_payload_to_state(
     payload: Dict[str, Any],
     property_name: str,
+    storage_key: str = "",
     preserve_calculation: bool = False,
 ) -> None:
     for key, default_value in DEFAULTS.items():
@@ -347,6 +353,7 @@ def apply_payload_to_state(
     st.session_state.listing_import_message = ""
     st.session_state.save_name = property_name
     st.session_state.loaded_property_name = property_name
+    st.session_state.loaded_property_storage_key = storage_key
     st.session_state.last_soi_lookup_address = str(st.session_state.property_address).strip()
     st.session_state.stamp_duty_auto_signature = ""
     if not preserve_calculation:
@@ -362,6 +369,7 @@ def consume_pending_payload_apply() -> None:
     apply_payload_to_state(
         pending["payload"],
         str(pending["property_name"]),
+        str(pending.get("storage_key", "")),
         preserve_calculation=bool(pending.get("preserve_calculation", False)),
     )
 
@@ -382,6 +390,14 @@ def set_authenticated_user(user: Dict[str, Any]) -> None:
     st.session_state["authenticated_username"] = str(user.get("username", ""))
     st.session_state["authenticated_email"] = str(user.get("email", ""))
     st.session_state["authenticated_is_admin"] = bool(user.get("is_admin"))
+
+
+def current_username() -> str:
+    return str(st.session_state.get("authenticated_username", "")).strip() or LEGACY_PROPERTY_OWNER
+
+
+def current_user_can_view_all_properties() -> bool:
+    return bool(st.session_state.get("authenticated_is_admin", False))
 
 
 def logout_user() -> None:
@@ -503,9 +519,13 @@ def render_auth_page() -> None:
 
 
 def delete_loaded_property_and_reset() -> None:
-    loaded_name = str(st.session_state.get("loaded_property_name", "")).strip()
+    loaded_name = str(st.session_state.get("loaded_property_storage_key", "") or st.session_state.get("loaded_property_name", "")).strip()
     if loaded_name:
-        delete_property(loaded_name)
+        delete_property(
+            loaded_name,
+            owner_username=current_username(),
+            include_all=current_user_can_view_all_properties(),
+        )
     reset_to_defaults()
 
 
@@ -951,19 +971,37 @@ def grouped_properties(saved_properties: List[Dict[str, Any]]) -> Dict[str, List
 
 def render_saved_property_row(item: Dict[str, Any], key_scope: str) -> None:
     label = str(item["name"])
-    display_label = f"★ {label}" if bool(item.get("is_favorite")) else label
+    storage_key = str(item.get("storage_key", label))
+    owner_username = str(item.get("owner_username", ""))
+    display_name = f"{label} ({owner_username})" if current_user_can_view_all_properties() and owner_username else label
+    display_label = f"★ {display_name}" if bool(item.get("is_favorite")) else display_name
     favorite_label = "★" if bool(item.get("is_favorite")) else "☆"
     favorite_col, load_col = st.columns([0.18, 0.82], gap="small")
-    if favorite_col.button(favorite_label, key=f"favorite_{key_scope}_{label}", use_container_width=True):
-        toggle_property_favorite(label)
+    if favorite_col.button(favorite_label, key=f"favorite_{key_scope}_{storage_key}", use_container_width=True):
+        toggle_property_favorite(
+            storage_key,
+            owner_username=current_username(),
+            include_all=current_user_can_view_all_properties(),
+        )
         st.rerun()
-    if load_col.button(display_label, key=f"load_{key_scope}_{label}", use_container_width=True):
-        loaded = load_property(label)
+    if load_col.button(display_label, key=f"load_{key_scope}_{storage_key}", use_container_width=True):
+        loaded = load_property(
+            storage_key,
+            owner_username=current_username(),
+            include_all=current_user_can_view_all_properties(),
+        )
         if loaded is not None:
-            apply_payload_to_state(loaded["payload"], label)
+            apply_payload_to_state(
+                loaded["payload"],
+                str(loaded["name"]),
+                str(loaded.get("storage_key", storage_key)),
+            )
             queue_active_page("Property workspace")
             st.rerun()
-    st.caption(f"{item['address']}")
+    if current_user_can_view_all_properties() and owner_username:
+        st.caption(f"{owner_username} · {item['address']}")
+    else:
+        st.caption(f"{item['address']}")
 
 
 def render_portfolio_screener_page(saved_properties: List[Dict[str, Any]]) -> None:
@@ -1130,8 +1168,8 @@ def render_portfolio_screener_page(saved_properties: List[Dict[str, Any]]) -> No
     metric_col_3.metric("WATCH", watch_count)
     metric_col_4.metric("AVOID", avoid_count)
 
-    st.session_state["portfolio_screener_row_keys"] = list(screener["Property"])
-    display_screener = screener.copy()
+    st.session_state["portfolio_screener_row_keys"] = list(screener["_storage_key"])
+    display_screener = screener.drop(columns=["_storage_key"]).copy()
     display_screener["Recommendation"] = display_screener["Recommendation"].map(recommendation_badge)
     for column in [
         "Price",
@@ -2022,8 +2060,15 @@ def deposit_comparison_table(payload: Dict[str, float | str]) -> pd.DataFrame:
 
 def saved_property_comparison_table() -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    for item in list_properties():
-        saved = load_property(str(item["name"]))
+    for item in list_properties(
+        owner_username=current_username(),
+        include_all=current_user_can_view_all_properties(),
+    ):
+        saved = load_property(
+            str(item.get("storage_key", item["name"])),
+            owner_username=current_username(),
+            include_all=current_user_can_view_all_properties(),
+        )
         if saved is None:
             continue
         payload = dict(DEFAULTS)
@@ -2032,6 +2077,7 @@ def saved_property_comparison_table() -> pd.DataFrame:
         rows.append(
             {
                 "Property": str(item["name"]),
+                "Owner": str(item.get("owner_username", "")),
                 "Price": as_number(payload.get("price")),
                 "Weekly rent": as_number(payload.get("weekly_rent")),
                 "Gross yield": float(metrics["gross_yield"]),
@@ -2045,7 +2091,10 @@ def saved_property_comparison_table() -> pd.DataFrame:
         )
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(["Overall / 10", "Net yield"], ascending=[False, False])
+    comparison = pd.DataFrame(rows).sort_values(["Overall / 10", "Net yield"], ascending=[False, False])
+    if not current_user_can_view_all_properties() and "Owner" in comparison.columns:
+        comparison = comparison.drop(columns=["Owner"])
+    return comparison
 
 
 def portfolio_price(payload: Dict[str, Any]) -> float:
@@ -2147,11 +2196,16 @@ def portfolio_screening_table(
     rows: List[Dict[str, Any]] = []
     usage_map = property_manager_usage or {}
     for item in saved_properties:
-        saved = load_property(str(item["name"]))
+        saved = load_property(
+            str(item.get("storage_key", item["name"])),
+            owner_username=current_username(),
+            include_all=current_user_can_view_all_properties(),
+        )
         if saved is None:
             continue
         property_name = str(item["name"])
-        use_property_manager_rate = as_bool(usage_map.get(property_name), default=True)
+        property_storage_key = str(item.get("storage_key", property_name))
+        use_property_manager_rate = as_bool(usage_map.get(property_storage_key), default=True)
         scenario_payload = build_portfolio_screening_payload(
             saved,
             shared,
@@ -2166,6 +2220,7 @@ def portfolio_screening_table(
                 "Use PM rate": use_property_manager_rate,
                 "Sold": "Yes" if bool(scenario_payload.get("is_sold")) else "No",
                 "Property": property_name,
+                "Owner": str(item.get("owner_username", "")),
                 "State": str(item["state"]),
                 "Price": as_number(scenario_payload.get("price")),
                 "Rent / wk": as_number(scenario_payload.get("weekly_rent")),
@@ -2184,11 +2239,14 @@ def portfolio_screening_table(
                 "Post-tax CF / yr": float(metrics["after_tax_cashflow"]),
                 "Overall / 10": float(metrics["overall_score"]),
                 "Buy now": "Yes" if str(metrics["recommendation"]) == "BUY" else "No",
+                "_storage_key": property_storage_key,
             }
         )
     if not rows:
         return pd.DataFrame()
     comparison = pd.DataFrame(rows)
+    if not current_user_can_view_all_properties() and "Owner" in comparison.columns:
+        comparison = comparison.drop(columns=["Owner"])
     return comparison.sort_values(
         ["Net yield", "Overall / 10", "Property"],
         ascending=[False, False, True],
@@ -3479,8 +3537,14 @@ def render_tabs(payload: Dict[str, Any]) -> None:
                     address=str(export_payload.get("property_address") or ""),
                     state=parse_state_from_address(str(export_payload.get("property_address") or "")),
                     payload=export_payload,
+                    owner_username=current_username(),
                 )
-                queue_payload_apply(export_payload, save_name, preserve_calculation=True)
+                queue_payload_apply(
+                    export_payload,
+                    save_name,
+                    storage_key=f"{current_username()}::{save_name}",
+                    preserve_calculation=True,
+                )
                 st.rerun()
             else:
                 st.error("Add a save name or property address first.")
@@ -3559,8 +3623,14 @@ def render_sidebar(saved_properties: List[Dict[str, Any]]) -> None:
                         address=str(sidebar_payload["property_address"]),
                         state=parse_state_from_address(str(sidebar_payload["property_address"])),
                         payload=sidebar_payload,
+                        owner_username=current_username(),
                     )
-                    queue_payload_apply(sidebar_payload, save_name, preserve_calculation=True)
+                    queue_payload_apply(
+                        sidebar_payload,
+                        save_name,
+                        storage_key=f"{current_username()}::{save_name}",
+                        preserve_calculation=True,
+                    )
                     st.rerun()
                 else:
                     st.error("Add a save name or property address first.")
@@ -4166,7 +4236,10 @@ def main() -> None:
         render_auth_page()
         return
 
-    saved_properties = list_properties()
+    saved_properties = list_properties(
+        owner_username=current_username(),
+        include_all=current_user_can_view_all_properties(),
+    )
     render_sidebar(saved_properties)
 
     st.markdown(

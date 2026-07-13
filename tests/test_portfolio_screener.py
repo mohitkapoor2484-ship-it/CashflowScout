@@ -313,12 +313,14 @@ class PortfolioScreenerTests(unittest.TestCase):
         saved_properties = [
             {
                 "name": "Lower Yield",
+                "storage_key": "mohitkapoor2484::Lower Yield",
                 "address": "1 Lower Street, Melbourne VIC 3000",
                 "state": "VIC",
                 "is_favorite": 0,
             },
             {
                 "name": "Higher Yield",
+                "storage_key": "mohitkapoor2484::Higher Yield",
                 "address": "2 Higher Street, Melbourne VIC 3000",
                 "state": "VIC",
                 "is_favorite": 0,
@@ -363,7 +365,13 @@ class PortfolioScreenerTests(unittest.TestCase):
             "income_tax_rate": 37.0,
         }
 
-        with patch.object(app, "load_property", side_effect=lambda name: loaded[name]):
+        with patch.object(
+            app,
+            "load_property",
+            side_effect=lambda name, owner_username=None, include_all=False: loaded[
+                name.removeprefix("mohitkapoor2484::")
+            ],
+        ):
             table = app.portfolio_screening_table(saved_properties, shared)
 
         self.assertEqual(list(table["Property"]), ["Higher Yield", "Lower Yield"])

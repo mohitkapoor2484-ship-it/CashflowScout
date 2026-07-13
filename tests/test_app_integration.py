@@ -75,6 +75,61 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
         self.assertEqual(app_test.session_state["active_page"], "Admin panel")
         self.assertTrue(bool(app_test.session_state["authenticated_is_admin"]))
 
+    def test_saved_properties_are_scoped_to_user_and_admin_sees_all(self) -> None:
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = Path(tmpdir) / "property_check.db"
+            with (
+                patch.object(storage, "DB_PATH", db_path),
+                patch("statement_lookup.lookup_statement_of_information", return_value=SOI_FAILURE),
+            ):
+                storage.init_db()
+                storage.save_property(
+                    name="Mohit Deal",
+                    address="1 Collins Street, Melbourne VIC 3000",
+                    state="VIC",
+                    payload={"property_address": "1 Collins Street, Melbourne VIC 3000", "price": 500000, "weekly_rent": 600},
+                    owner_username="mohitkapoor2484",
+                )
+                storage.save_property(
+                    name="Alice Deal",
+                    address="2 Queen Street, Brisbane QLD 4000",
+                    state="QLD",
+                    payload={"property_address": "2 Queen Street, Brisbane QLD 4000", "price": 420000, "weekly_rent": 520},
+                    owner_username="alice",
+                )
+
+                mohit_app = AppTest.from_file(APP_FILE, default_timeout=20)
+                authenticate_test_session(mohit_app)
+                mohit_app.session_state["authenticated_username"] = "mohitkapoor2484"
+                mohit_app.run()
+
+                alice_app = AppTest.from_file(APP_FILE, default_timeout=20)
+                authenticate_test_session(alice_app)
+                alice_app.session_state["authenticated_username"] = "alice"
+                alice_app.run()
+
+                admin_app = AppTest.from_file(APP_FILE, default_timeout=20)
+                authenticate_test_session(admin_app, is_admin=True)
+                admin_app.run()
+
+            self.assertEqual(len(mohit_app.exception), 0)
+            self.assertEqual(len(alice_app.exception), 0)
+            self.assertEqual(len(admin_app.exception), 0)
+
+            mohit_buttons = [item.label for item in mohit_app.button]
+            alice_buttons = [item.label for item in alice_app.button]
+            admin_buttons = [item.label for item in admin_app.button]
+
+            self.assertIn("Mohit Deal", mohit_buttons)
+            self.assertNotIn("Alice Deal", mohit_buttons)
+            self.assertIn("Alice Deal", alice_buttons)
+            self.assertNotIn("Mohit Deal", alice_buttons)
+            self.assertIn("Mohit Deal (mohitkapoor2484)", admin_buttons)
+            self.assertIn("Alice Deal (alice)", admin_buttons)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     def test_portfolio_screener_renders_dscr_column(self) -> None:
         saved_properties = [
             {
@@ -439,6 +494,7 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
         saved_properties = [
             {
                 "name": "Fav Candidate",
+                "storage_key": "tester::Fav Candidate",
                 "address": "1 Saved Street, Melbourne VIC 3000",
                 "state": "VIC",
                 "is_favorite": 0,
@@ -456,7 +512,11 @@ class PropertyCheckIntegrationTests(unittest.TestCase):
             next(item for item in app_test.button if item.label == "☆").click().run()
 
         self.assertEqual(len(app_test.exception), 0)
-        toggle_mock.assert_called_once_with("Fav Candidate")
+        toggle_mock.assert_called_once_with(
+            "tester::Fav Candidate",
+            owner_username="tester",
+            include_all=False,
+        )
 
     def test_favorite_property_can_render_in_favorites_and_state_sections_without_duplicate_keys(self) -> None:
         saved_properties = [

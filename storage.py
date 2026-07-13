@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 DB_PATH = Path(__file__).with_name("property_check.db")
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "ChangeMe123!"
+LEGACY_PROPERTY_OWNER = "mohitkapoor2484"
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -38,6 +39,45 @@ def init_db() -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(properties)").fetchall()}
         if "is_favorite" not in columns:
             conn.execute("ALTER TABLE properties ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
+        if "owner_username" not in columns:
+            conn.execute("ALTER TABLE properties ADD COLUMN owner_username TEXT")
+        if "display_name" not in columns:
+            conn.execute("ALTER TABLE properties ADD COLUMN display_name TEXT")
+        conn.execute(
+            "UPDATE properties SET owner_username = COALESCE(NULLIF(owner_username, ''), ?)",
+            (LEGACY_PROPERTY_OWNER,),
+        )
+        conn.execute(
+            """
+            UPDATE properties
+            SET display_name = CASE
+                WHEN display_name IS NULL OR display_name = '' THEN
+                    CASE
+                        WHEN instr(name, '::') > 0 THEN substr(name, instr(name, '::') + 2)
+                        ELSE name
+                    END
+                ELSE display_name
+            END
+            """
+        )
+        legacy_rows = conn.execute(
+            """
+            SELECT name, owner_username, display_name
+            FROM properties
+            WHERE instr(name, '::') = 0
+            """
+        ).fetchall()
+        for row in legacy_rows:
+            conn.execute(
+                "UPDATE properties SET name = ? WHERE name = ?",
+                (_property_storage_key(row["owner_username"], row["display_name"]), row["name"]),
+            )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_properties_owner_display_name
+            ON properties (owner_username, display_name)
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS app_settings (
@@ -98,48 +138,113 @@ def _ensure_default_admin(conn: sqlite3.Connection) -> None:
     )
 
 
-def save_property(name: str, address: str, state: str, payload: Dict[str, Any]) -> None:
+def _property_storage_key(owner_username: str, display_name: str) -> str:
+    return f"{owner_username.strip()}::{display_name.strip()}"
+
+
+def _property_lookup_clause(
+    property_name_or_key: str,
+    owner_username: Optional[str],
+    include_all: bool,
+) -> tuple[str, tuple[Any, ...]]:
+    lookup_value = property_name_or_key.strip()
+    if "::" in lookup_value:
+        return "name = ?", (lookup_value,)
+    if include_all:
+        return "display_name = ?", (lookup_value,)
+    scoped_owner = (owner_username or LEGACY_PROPERTY_OWNER).strip()
+    return "(name = ? OR (display_name = ? AND owner_username = ?))", (lookup_value, lookup_value, scoped_owner)
+
+
+def save_property(
+    name: str,
+    address: str,
+    state: str,
+    payload: Dict[str, Any],
+    owner_username: str = LEGACY_PROPERTY_OWNER,
+) -> None:
+    display_name = name.strip()
+    scoped_owner = owner_username.strip() or LEGACY_PROPERTY_OWNER
+    storage_key = _property_storage_key(scoped_owner, display_name)
     with _get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO properties (name, address, state, is_favorite, payload_json, created_at, updated_at)
-            VALUES (?, ?, ?, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            INSERT INTO properties (name, display_name, owner_username, address, state, is_favorite, payload_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(name) DO UPDATE SET
+                display_name = excluded.display_name,
+                owner_username = excluded.owner_username,
                 address = excluded.address,
                 state = excluded.state,
                 payload_json = excluded.payload_json,
                 updated_at = CURRENT_TIMESTAMP
             """,
-            (name, address, state, json.dumps(payload)),
+            (storage_key, display_name, scoped_owner, address, state, json.dumps(payload)),
         )
 
 
-def list_properties() -> List[Dict[str, Any]]:
+def list_properties(
+    owner_username: Optional[str] = None,
+    include_all: bool = False,
+) -> List[Dict[str, Any]]:
     with _get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT name, address, state, is_favorite, updated_at
-            FROM properties
-            ORDER BY is_favorite DESC, state ASC, updated_at DESC, name ASC
-            """
-        ).fetchall()
+        if include_all:
+            rows = conn.execute(
+                """
+                SELECT
+                    name AS storage_key,
+                    display_name AS name,
+                    owner_username,
+                    address,
+                    state,
+                    is_favorite,
+                    updated_at
+                FROM properties
+                ORDER BY owner_username ASC, is_favorite DESC, state ASC, updated_at DESC, display_name ASC
+                """
+            ).fetchall()
+        else:
+            scoped_owner = (owner_username or LEGACY_PROPERTY_OWNER).strip()
+            rows = conn.execute(
+                """
+                SELECT
+                    name AS storage_key,
+                    display_name AS name,
+                    owner_username,
+                    address,
+                    state,
+                    is_favorite,
+                    updated_at
+                FROM properties
+                WHERE owner_username = ?
+                ORDER BY is_favorite DESC, state ASC, updated_at DESC, display_name ASC
+                """,
+                (scoped_owner,),
+            ).fetchall()
     return [dict(row) for row in rows]
 
 
-def load_property(name: str) -> Optional[Dict[str, Any]]:
+def load_property(
+    name: str,
+    owner_username: Optional[str] = None,
+    include_all: bool = False,
+) -> Optional[Dict[str, Any]]:
+    where_clause, params = _property_lookup_clause(name, owner_username, include_all)
     with _get_connection() as conn:
         row = conn.execute(
             """
-            SELECT name, address, state, is_favorite, payload_json, updated_at
+            SELECT name, display_name, owner_username, address, state, is_favorite, payload_json, updated_at
             FROM properties
-            WHERE name = ?
+            WHERE """ + where_clause + """
             """,
-            (name,),
+            params,
         ).fetchone()
     if row is None:
         return None
     return {
-        "name": row["name"],
+        "name": row["display_name"],
+        "storage_key": row["name"],
+        "owner_username": row["owner_username"],
         "address": row["address"],
         "state": row["state"],
         "is_favorite": bool(row["is_favorite"]),
@@ -148,20 +253,33 @@ def load_property(name: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def delete_property(name: str) -> None:
+def delete_property(
+    name: str,
+    owner_username: Optional[str] = None,
+    include_all: bool = False,
+) -> None:
+    where_clause, params = _property_lookup_clause(name, owner_username, include_all)
     with _get_connection() as conn:
-        conn.execute("DELETE FROM properties WHERE name = ?", (name,))
+        conn.execute("DELETE FROM properties WHERE " + where_clause, params)
 
 
-def toggle_property_favorite(name: str) -> Optional[bool]:
+def toggle_property_favorite(
+    name: str,
+    owner_username: Optional[str] = None,
+    include_all: bool = False,
+) -> Optional[bool]:
+    where_clause, params = _property_lookup_clause(name, owner_username, include_all)
     with _get_connection() as conn:
-        row = conn.execute("SELECT is_favorite FROM properties WHERE name = ?", (name,)).fetchone()
+        row = conn.execute(
+            "SELECT name, is_favorite FROM properties WHERE " + where_clause,
+            params,
+        ).fetchone()
         if row is None:
             return None
         new_value = 0 if bool(row["is_favorite"]) else 1
         conn.execute(
             "UPDATE properties SET is_favorite = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?",
-            (new_value, name),
+            (new_value, row["name"]),
         )
     return bool(new_value)
 

@@ -136,6 +136,45 @@ class StorageFavoritesTests(unittest.TestCase):
 
         self.assertIsNone(admin_attempt)
 
+    def test_properties_are_scoped_by_owner_and_admin_can_list_all(self) -> None:
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = Path(tmpdir) / "property_check.db"
+            with patch.object(storage, "DB_PATH", db_path):
+                storage.init_db()
+                storage.save_property(
+                    name="Shared Label",
+                    address="1 User One Street, Melbourne VIC 3000",
+                    state="VIC",
+                    payload={"property_address": "1 User One Street, Melbourne VIC 3000"},
+                    owner_username="user_one",
+                )
+                storage.save_property(
+                    name="Shared Label",
+                    address="2 User Two Street, Brisbane QLD 4000",
+                    state="QLD",
+                    payload={"property_address": "2 User Two Street, Brisbane QLD 4000"},
+                    owner_username="user_two",
+                )
+
+                user_one_items = storage.list_properties(owner_username="user_one")
+                user_two_items = storage.list_properties(owner_username="user_two")
+                admin_items = storage.list_properties(include_all=True)
+                loaded_user_one = storage.load_property("Shared Label", owner_username="user_one")
+                loaded_user_two = storage.load_property("Shared Label", owner_username="user_two")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        self.assertEqual(len(user_one_items), 1)
+        self.assertEqual(len(user_two_items), 1)
+        self.assertEqual(len(admin_items), 2)
+        self.assertEqual(user_one_items[0]["owner_username"], "user_one")
+        self.assertEqual(user_two_items[0]["owner_username"], "user_two")
+        self.assertTrue(user_one_items[0]["storage_key"].startswith("user_one::"))
+        self.assertTrue(user_two_items[0]["storage_key"].startswith("user_two::"))
+        self.assertEqual(loaded_user_one["address"], "1 User One Street, Melbourne VIC 3000")
+        self.assertEqual(loaded_user_two["address"], "2 User Two Street, Brisbane QLD 4000")
+
 
 if __name__ == "__main__":
     unittest.main()
